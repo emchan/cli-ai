@@ -487,7 +487,7 @@ This folder also contains `framepack-cli.py`, a command-line adaptation of Frame
 /tmp/framepack-cli/bin/python framepack-cli.py "a dancing man" -i input.png
 ```
 
-Outputs are written to `outputs/<prompt>-<datestamp>.mp4`.
+Outputs are written to `outputs/<prompt>-<seed>.mp4`.
 
 ### Options
 
@@ -511,7 +511,7 @@ The port was driven by the following user requests (in order):
 Implementation notes:
 
 - Reused `demo_gradio.py`'s `worker()` generation pipeline, replacing Gradio/async streaming with synchronous progress prints.
-- Output filename uses a sanitized prompt plus a datestamp (`YYYY-MM-DD_HH-MM-SS`).
+- Output filename uses a sanitized prompt plus the seed (`<prompt>-<seed>.mp4`).
 - Virtual environment created at `/tmp/framepack-cli` (Python 3.11) with dependencies provided via the existing `fp311` environment.
 - Source dependencies (`diffusers_helper`, demos) are not vendored; `framepack-cli.py` locates them in `/tmp/FramePack` or `~/.cache/framepack-src/FramePack`, cloning from GitHub on demand.
 

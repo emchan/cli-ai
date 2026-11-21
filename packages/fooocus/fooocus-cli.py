@@ -17,6 +17,28 @@ import sys
 # Script/output root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Ensure a dedicated venv exists for this CLI.
+VENV_DIR = os.path.expanduser("~/cli-ai/fooocus-cli")
+if os.path.abspath(sys.prefix) != os.path.abspath(VENV_DIR):
+    os.makedirs(os.path.dirname(VENV_DIR), exist_ok=True)
+    if not os.path.exists(os.path.join(VENV_DIR, "bin", "python")):
+        print(f"Creating venv at {VENV_DIR} ...", flush=True)
+        try:
+            subprocess.run([sys.executable, "-m", "venv", VENV_DIR], check=True)
+        except Exception:
+            subprocess.run(["virtualenv", "-p", sys.executable, VENV_DIR], check=True)
+    pip = os.path.join(VENV_DIR, "bin", "pip")
+    req = os.path.join(SCRIPT_DIR, "requirements_original.txt")
+    if os.path.exists(req):
+        print("Installing requirements into venv ...", flush=True)
+        subprocess.run(
+            [pip, "install", "-r", req,
+             "--extra-index-url", "https://download.pytorch.org/whl/cu121"],
+            check=True,
+        )
+    os.execv(os.path.join(VENV_DIR, "bin", "python"),
+             [os.path.join(VENV_DIR, "bin", "python")] + sys.argv)
+
 # Parse our own CLI arguments *before* importing Fooocus, because Fooocus parses
 # sys.argv during import.
 _parser = argparse.ArgumentParser(description="Fooocus CLI")
@@ -58,6 +80,12 @@ if SCRIPT_DIR not in sys.path:
 
 # Keep generated images in <script_dir>/outputs.
 os.environ.setdefault("path_outputs", os.path.join(SCRIPT_DIR, "outputs"))
+
+# Store Hugging Face downloads under ~/cli-ai/hf_downloads.
+HF_DOWNLOADS = os.path.expanduser("~/cli-ai/hf_downloads")
+os.makedirs(HF_DOWNLOADS, exist_ok=True)
+os.environ.setdefault("HF_HOME", HF_DOWNLOADS)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(HF_DOWNLOADS, "hub"))
 
 # Prevent Fooocus from launching the Gradio web server on import.
 import gradio as gr

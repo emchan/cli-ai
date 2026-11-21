@@ -2,6 +2,14 @@
 
 Command-line interface for [Fooocus](https://github.com/lllyasviel/Fooocus).
 
+## What is Fooocus?
+
+Fooocus is an offline, open-source image generation tool built on Stable Diffusion XL. It is designed to be simple and user-friendly: users focus on prompts and images rather than manual parameter tuning, similar to online generators like Midjourney. It runs locally, requires a 4GB+ NVIDIA GPU, and downloads its models automatically.
+
+## License
+
+This is a command-line wrapper around the Fooocus core. Fooocus retains its original license: **GNU General Public License v3.0 (GPL-3.0)**. See the upstream project for full license terms.
+
 ## Usage
 
 ```bash

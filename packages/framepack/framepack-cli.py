@@ -5,7 +5,7 @@ Usage:
     python framepack-cli.py "a dancing man" --input image.png
     python framepack-cli.py --prompt "a dancing man" -i image.png
 
-Generates a video with FramePack and saves it to outputs/<prompt>-<datestamp>.mp4.
+Generates a video with FramePack and saves it to outputs/<prompt>-<seed>.mp4.
 """
 import argparse
 import datetime
@@ -17,6 +17,128 @@ import traceback
 import math
 import shutil
 import subprocess
+import glob
+
+# Script/output root.
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---------------------------------------------------------------------------
+# Self-bootstrapping virtual environment.
+# FramePack needs a large set of Python packages (torch, diffusers, ...). To
+# keep the script self-contained we make sure a dedicated venv exists and
+# re-exec ourselves with it when the current interpreter lacks the deps.
+# ---------------------------------------------------------------------------
+FRAMEPACK_VENV_DIR = os.environ.get("FRAMEPACK_VENV", os.path.expanduser("~/cli-ai/framepack-cli"))
+
+
+def _find_fp311_site_packages():
+    candidates = [
+        "/home/ubuntu/miniconda3/envs/fp311/lib/python3.11/site-packages",
+    ]
+    for pattern in (
+        "/opt/conda/envs/fp311/lib/python*/site-packages",
+        "/root/miniconda3/envs/fp311/lib/python*/site-packages",
+        "/home/*/.conda/envs/fp311/lib/python*/site-packages",
+        "/home/*/*conda*/envs/fp311/lib/python*/site-packages",
+        "/usr/local/miniconda3/envs/fp311/lib/python*/site-packages",
+    ):
+        candidates.extend(glob.glob(pattern))
+    for cand in candidates:
+        if os.path.isdir(cand) and os.path.exists(os.path.join(cand, "torch", "__init__.py")):
+            return cand
+    return None
+
+
+def _base_python():
+    for name in ("python3.11", "python3", "python"):
+        path = shutil.which(name)
+        if path:
+            return path
+    return sys.executable
+
+
+def _venv_python():
+    return os.path.join(FRAMEPACK_VENV_DIR, "bin", "python")
+
+
+def _venv_site_packages():
+    matches = glob.glob(os.path.join(FRAMEPACK_VENV_DIR, "lib", "python*", "site-packages"))
+    if not matches:
+        matches = glob.glob(os.path.join(FRAMEPACK_VENV_DIR, "Lib", "site-packages"))
+    if not matches:
+        raise RuntimeError("could not locate venv site-packages")
+    return matches[0]
+
+
+def _venv_ok(python):
+    try:
+        subprocess.run(
+            [python, "-c", "import torch, diffusers, transformers"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True,
+            timeout=300,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _create_venv():
+    if os.path.exists(FRAMEPACK_VENV_DIR):
+        shutil.rmtree(FRAMEPACK_VENV_DIR)
+    parent = os.path.dirname(FRAMEPACK_VENV_DIR)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    subprocess.run([_base_python(), "-m", "venv", FRAMEPACK_VENV_DIR], check=True)
+
+
+def _install_requirements(python):
+    req_candidates = [
+        os.path.join(SCRIPT_DIR, "requirements.txt"),
+        "/tmp/FramePack/requirements.txt",
+        os.path.join(os.path.expanduser("~"), ".cache", "framepack-src", "FramePack", "requirements.txt"),
+    ]
+    for req in req_candidates:
+        if os.path.exists(req):
+            subprocess.run(
+                [python, "-m", "pip", "install", "-r", req,
+                 "--extra-index-url", "https://download.pytorch.org/whl/cu126"],
+                check=False,
+            )
+            return
+
+
+def ensure_framepack_venv():
+    python = _venv_python()
+    if not (os.path.exists(python) and _venv_ok(python)):
+        _create_venv()
+        python = _venv_python()
+        site = _venv_site_packages()
+        fp_site = _find_fp311_site_packages()
+        if fp_site is not None:
+            with open(os.path.join(site, "fp311.pth"), "w") as f:
+                f.write(fp_site + "\n")
+        if not _venv_ok(python):
+            _install_requirements(python)
+    return python
+
+
+# Bootstrap when the current interpreter does not already provide the deps.
+if os.environ.get("FRAMEPACK_CLI_SKIP_VENV") != "1":
+    try:
+        import torch  # noqa: F401
+        import diffusers  # noqa: F401
+        import transformers  # noqa: F401
+
+        _framepack_deps_present = True
+    except Exception:
+        _framepack_deps_present = False
+    if not _framepack_deps_present:
+        _framepack_venv_python = ensure_framepack_venv()
+        if os.path.abspath(sys.executable) != os.path.abspath(_framepack_venv_python):
+            os.environ.setdefault("FRAMEPACK_CLI_BOOTSTRAPPED", "1")
+            os.execv(_framepack_venv_python, [_framepack_venv_python] + sys.argv)
 
 # Script/output root.
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -49,6 +171,12 @@ def ensure_framepack_source():
 SOURCE_ROOT = ensure_framepack_source()
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
+
+# Store Hugging Face downloads under ~/cli-ai/hf_downloads (home folder).
+HF_DOWNLOADS = os.path.expanduser("~/cli-ai/hf_downloads")
+os.makedirs(HF_DOWNLOADS, exist_ok=True)
+os.environ.setdefault("HF_HOME", HF_DOWNLOADS)
+os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(HF_DOWNLOADS, "hub"))
 
 import numpy as np
 import torch
@@ -359,8 +487,7 @@ def main():
     if args.output:
         output_path = args.output
     else:
-        stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        output_path = os.path.join(outputs_folder, f"{sanitize_filename(prompt)}-{stamp}.mp4")
+        output_path = os.path.join(outputs_folder, f"{sanitize_filename(prompt)}-{args.seed}.mp4")
 
     # User requested outputs/<prompt>-<datestamp>.mp4 relative to ROOT; ensure outputs dir.
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
