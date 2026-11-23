@@ -17,7 +17,7 @@ import glob
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
-# Self-bootstrapping virtual environment.
+# Self-bootstrapping environment (conda/Miniforge preferred; venv fallback).
 # ---------------------------------------------------------------------------
 VENV_DIR = os.environ.get("STABLE_AUDIO_VENV", os.path.expanduser("~/cli-ai/stable-audio-cli"))
 
@@ -30,17 +30,8 @@ def _base_python():
     return sys.executable
 
 
-def _venv_python():
-    return os.path.join(VENV_DIR, "bin", "python")
-
-
-def _venv_site_packages():
-    matches = glob.glob(os.path.join(VENV_DIR, "lib", "python*", "site-packages"))
-    if not matches:
-        matches = glob.glob(os.path.join(VENV_DIR, "Lib", "site-packages"))
-    if not matches:
-        raise RuntimeError("could not locate venv site-packages")
-    return matches[0]
+def _venv_python(prefix):
+    return os.path.join(prefix, "bin", "python")
 
 
 def _venv_ok(python):
@@ -58,17 +49,6 @@ def _venv_ok(python):
         return True
     except Exception:
         return False
-
-
-def _create_venv():
-    if os.path.exists(VENV_DIR):
-        shutil.rmtree(VENV_DIR)
-    parent = os.path.dirname(VENV_DIR)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    # Use system site-packages so a pre-installed torch (if any) is reused,
-    # avoiding huge downloads on first run when possible.
-    subprocess.run([_base_python(), "-m", "venv", "--system-site-packages", VENV_DIR], check=True)
 
 
 def _torch_available(python):
@@ -89,28 +69,87 @@ def _install_requirements(python):
     req = os.path.join(SCRIPT_DIR, "requirements.txt")
     if not os.path.exists(req):
         return
-    if _torch_available(python):
-        # Reuse the (system) torch/torchaudio already available; install the rest.
-        filtered = os.path.join(VENV_DIR, "requirements.notorch.txt")
-        with open(req) as f:
-            lines = [ln for ln in f if not ln.strip().lower().startswith(("torch==", "torchaudio==", "torch>=", "torchaudio>="))]
-        with open(filtered, "w") as f:
-            f.writelines(lines)
-        req_to_use = filtered
-    else:
-        req_to_use = req
-    subprocess.run(
-        [python, "-m", "pip", "install", "-r", req_to_use,
-         "--extra-index-url", "https://download.pytorch.org/whl/cu126"],
-        check=True,
-    )
+    try:
+        if _torch_available(python):
+            filtered = os.path.join(os.path.dirname(python), "..", "requirements.notorch.txt")
+            filtered = os.path.normpath(filtered)
+            with open(req) as f:
+                lines = [ln for ln in f if not ln.strip().lower().startswith(("torch==", "torchaudio==", "torch>=", "torchaudio>="))]
+            with open(filtered, "w") as f:
+                f.writelines(lines)
+            req_to_use = filtered
+        else:
+            req_to_use = req
+        subprocess.run(
+            [python, "-m", "pip", "install", "-r", req_to_use,
+             "--extra-index-url", "https://download.pytorch.org/whl/cu126"],
+            check=True,
+        )
+    except Exception as e:
+        print(f"pip install failed: {e}", flush=True)
+
+
+def _ensure_miniforge():
+    conda_bin = shutil.which("conda")
+    mamba_bin = shutil.which("mamba")
+    micromamba_bin = shutil.which("micromamba")
+    forge_bin = mamba_bin or conda_bin or micromamba_bin
+    if forge_bin:
+        return forge_bin, micromamba_bin
+    miniforge_prefix = os.path.expanduser("~/miniforge3")
+    miniforge_bin = os.path.join(miniforge_prefix, "bin", "conda")
+    if os.path.exists(miniforge_bin):
+        return miniforge_bin, None
+    print("Miniforge/conda not found; downloading and installing Miniforge...", flush=True)
+    try:
+        installer = os.path.join("/tmp", "Miniforge3-Linux-x86_64.sh")
+        if not os.path.exists(installer):
+            subprocess.run(
+                ["bash", "-lc",
+                 "curl -L -o /tmp/Miniforge3-Linux-x86_64.sh https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"],
+                check=True,
+            )
+        subprocess.run(["bash", installer, "-b", "-p", miniforge_prefix], check=True)
+        if os.path.exists(miniforge_bin):
+            return miniforge_bin, None
+    except Exception as e:
+        print(f"Miniforge install failed: {e}", flush=True)
+    return None, None
 
 
 def ensure_venv():
-    python = _venv_python()
+    forge_bin, micromamba_bin = _ensure_miniforge()
+    if forge_bin:
+        parent = os.path.dirname(VENV_DIR)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        py = _venv_python(VENV_DIR)
+        if not (os.path.exists(py) and _venv_ok(py)):
+            if os.path.exists(VENV_DIR):
+                shutil.rmtree(VENV_DIR)
+            print(f"Creating conda env for stable-audio at {VENV_DIR} ...", flush=True)
+            try:
+                if micromamba_bin and "micromamba" in (micromamba_bin or ""):
+                    subprocess.run([micromamba_bin, "create", "-y", "-p", VENV_DIR, "python=3.11", "pip"], check=True)
+                else:
+                    subprocess.run([forge_bin, "create", "-y", "-p", VENV_DIR, "python=3.11", "pip"], check=True)
+            except Exception as e:
+                print(f"conda env creation failed: {e}", flush=True)
+        py = _venv_python(VENV_DIR)
+        if os.path.exists(py):
+            if not _venv_ok(py):
+                _install_requirements(py)
+            return py
+    # Fallback to venv
+    python = _venv_python(VENV_DIR)
     if not (os.path.exists(python) and _venv_ok(python)):
-        _create_venv()
-        python = _venv_python()
+        if os.path.exists(VENV_DIR):
+            shutil.rmtree(VENV_DIR)
+        parent = os.path.dirname(VENV_DIR)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        subprocess.run([_base_python(), "-m", "venv", "--system-site-packages", VENV_DIR], check=True)
+        python = _venv_python(VENV_DIR)
         if not _venv_ok(python):
             _install_requirements(python)
     return python

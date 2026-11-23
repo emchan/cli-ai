@@ -8,5 +8,13 @@ The initial versions target the original CUDA setup. Efforts are underway to por
 
 - `packages/fooocus/` — Fooocus CLI (`fooocus-cli.py`)
 - `packages/framepack/` — FramePack CLI (`framepack-cli.py`)
-PY
-echo done
+
+## Examples
+
+### Fooocus
+
+Generate an idyllic beachscape with roaring waves and a lighthouse, saving to `beach.png`:
+
+```bash
+python packages/fooocus/fooocus-cli.py "idyllic beach scape with roaring waves and a lighthouse" --output beach.png
+```

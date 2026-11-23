@@ -23,10 +23,7 @@ import glob
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
-# Self-bootstrapping virtual environment.
-# FramePack needs a large set of Python packages (torch, diffusers, ...). To
-# keep the script self-contained we make sure a dedicated venv exists and
-# re-exec ourselves with it when the current interpreter lacks the deps.
+# Self-bootstrapping environment (conda/Miniforge preferred; venv fallback).
 # ---------------------------------------------------------------------------
 FRAMEPACK_VENV_DIR = os.environ.get("FRAMEPACK_VENV", os.path.expanduser("~/cli-ai/framepack-cli"))
 
@@ -57,14 +54,14 @@ def _base_python():
     return sys.executable
 
 
-def _venv_python():
-    return os.path.join(FRAMEPACK_VENV_DIR, "bin", "python")
+def _venv_python(prefix):
+    return os.path.join(prefix, "bin", "python")
 
 
-def _venv_site_packages():
-    matches = glob.glob(os.path.join(FRAMEPACK_VENV_DIR, "lib", "python*", "site-packages"))
+def _venv_site_packages(prefix):
+    matches = glob.glob(os.path.join(prefix, "lib", "python*", "site-packages"))
     if not matches:
-        matches = glob.glob(os.path.join(FRAMEPACK_VENV_DIR, "Lib", "site-packages"))
+        matches = glob.glob(os.path.join(prefix, "Lib", "site-packages"))
     if not matches:
         raise RuntimeError("could not locate venv site-packages")
     return matches[0]
@@ -84,15 +81,6 @@ def _venv_ok(python):
         return False
 
 
-def _create_venv():
-    if os.path.exists(FRAMEPACK_VENV_DIR):
-        shutil.rmtree(FRAMEPACK_VENV_DIR)
-    parent = os.path.dirname(FRAMEPACK_VENV_DIR)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    subprocess.run([_base_python(), "-m", "venv", FRAMEPACK_VENV_DIR], check=True)
-
-
 def _install_requirements(python):
     req_candidates = [
         os.path.join(SCRIPT_DIR, "requirements.txt"),
@@ -101,24 +89,86 @@ def _install_requirements(python):
     ]
     for req in req_candidates:
         if os.path.exists(req):
-            subprocess.run(
-                [python, "-m", "pip", "install", "-r", req,
-                 "--extra-index-url", "https://download.pytorch.org/whl/cu126"],
-                check=False,
-            )
+            try:
+                subprocess.run(
+                    [python, "-m", "pip", "install", "-r", req,
+                     "--extra-index-url", "https://download.pytorch.org/whl/cu126"],
+                    check=False,
+                )
+            except Exception as e:
+                print(f"pip install failed: {e}", flush=True)
             return
 
 
+def _ensure_miniforge():
+    conda_bin = shutil.which("conda")
+    mamba_bin = shutil.which("mamba")
+    micromamba_bin = shutil.which("micromamba")
+    forge_bin = mamba_bin or conda_bin or micromamba_bin
+    if forge_bin:
+        return forge_bin, micromamba_bin
+    miniforge_prefix = os.path.expanduser("~/miniforge3")
+    miniforge_bin = os.path.join(miniforge_prefix, "bin", "conda")
+    if os.path.exists(miniforge_bin):
+        return miniforge_bin, None
+    print("Miniforge/conda not found; downloading and installing Miniforge...", flush=True)
+    try:
+        installer = os.path.join("/tmp", "Miniforge3-Linux-x86_64.sh")
+        if not os.path.exists(installer):
+            subprocess.run(
+                ["bash", "-lc",
+                 "curl -L -o /tmp/Miniforge3-Linux-x86_64.sh https://github.com/conda-forge/miniforge/releases/latest/download/Miniforge3-Linux-x86_64.sh"],
+                check=True,
+            )
+        subprocess.run(["bash", installer, "-b", "-p", miniforge_prefix], check=True)
+        if os.path.exists(miniforge_bin):
+            return miniforge_bin, None
+    except Exception as e:
+        print(f"Miniforge install failed: {e}", flush=True)
+    return None, None
+
+
 def ensure_framepack_venv():
-    python = _venv_python()
+    forge_bin, micromamba_bin = _ensure_miniforge()
+    if forge_bin:
+        parent = os.path.dirname(FRAMEPACK_VENV_DIR)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        py = _venv_python(FRAMEPACK_VENV_DIR)
+        if not (os.path.exists(py) and _venv_ok(py)):
+            if os.path.exists(FRAMEPACK_VENV_DIR):
+                shutil.rmtree(FRAMEPACK_VENV_DIR)
+            print(f"Creating conda env for FramePack at {FRAMEPACK_VENV_DIR} ...", flush=True)
+            try:
+                if micromamba_bin and "micromamba" in (micromamba_bin or ""):
+                    subprocess.run([micromamba_bin, "create", "-y", "-p", FRAMEPACK_VENV_DIR, "python=3.11", "pip"], check=True)
+                else:
+                    subprocess.run([forge_bin, "create", "-y", "-p", FRAMEPACK_VENV_DIR, "python=3.11", "pip"], check=True)
+            except Exception as e:
+                print(f"conda env creation failed: {e}", flush=True)
+        py = _venv_python(FRAMEPACK_VENV_DIR)
+        if os.path.exists(py):
+            if not _venv_ok(py):
+                _install_requirements(py)
+            return py
+    # Fallback to venv
+    python = _venv_python(FRAMEPACK_VENV_DIR)
     if not (os.path.exists(python) and _venv_ok(python)):
-        _create_venv()
-        python = _venv_python()
-        site = _venv_site_packages()
-        fp_site = _find_fp311_site_packages()
-        if fp_site is not None:
-            with open(os.path.join(site, "fp311.pth"), "w") as f:
-                f.write(fp_site + "\n")
+        if os.path.exists(FRAMEPACK_VENV_DIR):
+            shutil.rmtree(FRAMEPACK_VENV_DIR)
+        parent = os.path.dirname(FRAMEPACK_VENV_DIR)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        subprocess.run([_base_python(), "-m", "venv", FRAMEPACK_VENV_DIR], check=True)
+        python = _venv_python(FRAMEPACK_VENV_DIR)
+        try:
+            site = _venv_site_packages(FRAMEPACK_VENV_DIR)
+            fp_site = _find_fp311_site_packages()
+            if fp_site is not None:
+                with open(os.path.join(site, "fp311.pth"), "w") as f:
+                    f.write(fp_site + "\n")
+        except Exception:
+            pass
         if not _venv_ok(python):
             _install_requirements(python)
     return python
