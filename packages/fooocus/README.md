@@ -16,7 +16,9 @@ This is a command-line wrapper around the Fooocus core. Fooocus retains its orig
 /tmp/fooocus-cli/bin/python fooocus-cli.py "a cute cat" [--negative "..."] [--seed N] [--output path]
 ```
 
-Output images are written to `outputs/<prompt>-<seed>.png`.
+Output images are written to `outputs/<prompt>-<seed>.png`. Paths given with
+`--output` are resolved relative to the folder you run the command from, so
+`--output beach.png` writes `beach.png` into your current folder.
 
 ## Environment
 

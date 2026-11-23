@@ -19,6 +19,7 @@ import os
 import re
 import sys
 import traceback
+from contextlib import contextmanager
 
 import math
 import shutil
@@ -319,6 +320,57 @@ outputs_folder = os.path.join(ROOT, "outputs")
 os.makedirs(outputs_folder, exist_ok=True)
 
 
+def _keep_output_capture_on_swapped_model(model):
+    """Keep hidden-state capture working after DynamicSwapInstaller.
+
+    DynamicSwapInstaller replaces a module's class with a generated subclass.
+    transformers >= 5 looks output hooks up by the exact class string, so the
+    generated name makes `output_hidden_states=True` silently return None.
+    Give the generated class the original identity; the override stays valid
+    on older transformers versions too.
+    """
+    swapped_cls = type(model)
+    if not swapped_cls.__name__.startswith("DynamicSwap_"):
+        return
+    original_cls = swapped_cls.__bases__[0]
+    swapped_cls.__name__ = original_cls.__name__
+    swapped_cls.__qualname__ = original_cls.__qualname__
+    swapped_cls.__module__ = original_cls.__module__
+
+
+@contextmanager
+def _memory_efficient_attention_on_older_gpus():
+    """Avoid the O(n^2) SDPA fallback on GPUs without bf16 flash support.
+
+    FramePack's attention kernels call `F.scaled_dot_product_attention` with
+    bfloat16 tensors. On pre-Ampere GPUs (e.g. T4) PyTorch has no efficient
+    bf16 kernel and falls back to materializing the full attention matrix.
+    Running that call in fp16 through the memory-efficient kernel keeps VRAM
+    usage bounded; newer GPUs keep their native flash/cudnn kernels.
+    """
+    if not (torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0)):
+        yield
+        return
+
+    import torch.nn.functional as F
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    original_sdpa = F.scaled_dot_product_attention
+
+    def sdpa(query, key, value, *args, **kwargs):
+        if query.is_cuda and query.dtype == torch.bfloat16:
+            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
+                result = original_sdpa(query.half(), key.half(), value.half(), *args, **kwargs)
+            return result.to(torch.bfloat16)
+        return original_sdpa(query, key, value, *args, **kwargs)
+
+    F.scaled_dot_product_attention = sdpa
+    try:
+        yield
+    finally:
+        F.scaled_dot_product_attention = original_sdpa
+
+
 def load_models():
     global free_mem_gb, high_vram
     global text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae
@@ -369,6 +421,7 @@ def load_models():
     if not high_vram:
         DynamicSwapInstaller.install_model(transformer, device=gpu)
         DynamicSwapInstaller.install_model(text_encoder, device=gpu)
+        _keep_output_capture_on_swapped_model(text_encoder)
     else:
         text_encoder.to(gpu)
         text_encoder_2.to(gpu)
@@ -650,22 +703,23 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     print(f"Output: {output_path}")
-    run_generation(
-        input_image=input_image,
-        prompt=prompt,
-        output_path=output_path,
-        n_prompt=args.negative,
-        seed=args.seed,
-        total_second_length=args.seconds,
-        latent_window_size=args.latent_window_size,
-        steps=args.steps,
-        cfg=args.cfg,
-        gs=args.gs,
-        rs=args.rs,
-        gpu_memory_preservation=args.gpu_memory_preservation,
-        use_teacache=args.teacache,
-        mp4_crf=args.crf,
-    )
+    with _memory_efficient_attention_on_older_gpus():
+        run_generation(
+            input_image=input_image,
+            prompt=prompt,
+            output_path=output_path,
+            n_prompt=args.negative,
+            seed=args.seed,
+            total_second_length=args.seconds,
+            latent_window_size=args.latent_window_size,
+            steps=args.steps,
+            cfg=args.cfg,
+            gs=args.gs,
+            rs=args.rs,
+            gpu_memory_preservation=args.gpu_memory_preservation,
+            use_teacache=args.teacache,
+            mp4_crf=args.crf,
+        )
     print(f"Done: {output_path}")
 
 

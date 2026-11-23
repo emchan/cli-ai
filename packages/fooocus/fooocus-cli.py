@@ -17,6 +17,10 @@ import sys
 # Script/output root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Folder the CLI was launched from. The script chdir()s to the upstream Fooocus
+# source below, so keep this to resolve --output against the caller's folder.
+INVOCATION_DIR = os.getcwd()
+
 # Ensure a dedicated env exists for this CLI (prefer Miniforge/conda/mamba).
 VENV_DIR = os.path.expanduser("~/cli-ai/fooocus-cli")
 if os.environ.get("FOOOCUS_NO_VENV") == "1":
@@ -152,7 +156,10 @@ _parser.add_argument("prompt", nargs="?", help="Text prompt to generate an image
 _parser.add_argument("--prompt", dest="prompt_opt", default=None, help="Text prompt (alternative to positional).")
 _parser.add_argument("--negative", default=None, help="Negative prompt.")
 _parser.add_argument("--seed", type=int, default=None, help="Seed for generation.")
-_parser.add_argument("--output", default=None, help="Explicit output file path.")
+_parser.add_argument(
+    "--output", default=None,
+    help="Explicit output file path (relative paths are resolved against the folder you run this from).",
+)
 CLI_ARGS = _parser.parse_args()
 
 # Prevent Fooocus's argument parser from choking on our positional prompt.
@@ -210,6 +217,19 @@ def sanitize_filename(text: str) -> str:
     if not text:
         text = "prompt"
     return text[:80]
+
+
+def resolve_output_path(path: str) -> str:
+    """Resolve --output against the folder the CLI was run from.
+
+    The upstream source is imported from its own directory (see the chdir()
+    above), so a bare filename like ``beach.png`` would otherwise be written
+    into that source cache instead of the caller's current folder.
+    """
+    path = os.path.expandvars(os.path.expanduser(path))
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+    return os.path.abspath(os.path.join(INVOCATION_DIR, path))
 
 
 def main():
@@ -273,7 +293,7 @@ def main():
     seed_for_name = getattr(task, "seed", seed_value)
 
     if args.output:
-        dst = args.output
+        dst = resolve_output_path(args.output)
     else:
         os.makedirs(os.path.join(SCRIPT_DIR, "outputs"), exist_ok=True)
         dst = os.path.join(SCRIPT_DIR, "outputs",
