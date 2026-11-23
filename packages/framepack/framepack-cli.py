@@ -4,6 +4,12 @@
 Usage:
     python framepack-cli.py "a dancing man" --input image.png
     python framepack-cli.py --prompt "a dancing man" -i image.png
+    python framepack-cli.py "a dancing man"   # uses an image from the current folder
+    python framepack-cli.py image.png "big waves crashing"   # image may come first
+
+Relative image paths are resolved against the folder you run the command from,
+not the folder containing this script. If --input is omitted, the most recently
+modified image in that folder is used.
 
 Generates a video with FramePack and saves it to outputs/<prompt>-<seed>.mp4.
 """
@@ -21,6 +27,10 @@ import glob
 
 # Script/output root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Folder the CLI was launched from. The script chdir()s to ROOT below, so keep
+# this to resolve user-supplied relative image paths against the current folder.
+INVOCATION_DIR = os.getcwd()
 
 # ---------------------------------------------------------------------------
 # Self-bootstrapping environment (conda/Miniforge preferred; venv fallback).
@@ -251,6 +261,58 @@ def sanitize_filename(text: str) -> str:
     if not text:
         text = "prompt"
     return text[:80]
+
+
+IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+
+def resolve_input_path(path):
+    """Resolve an input image path against the folder the CLI was run from.
+
+    Absolute paths are used as-is. Relative paths are checked in the invocation
+    directory first, then in the script directory for backwards compatibility
+    with images placed next to framepack-cli.py.
+    """
+    path = os.path.expandvars(os.path.expanduser(path))
+    if os.path.isabs(path):
+        return os.path.abspath(path)
+
+    in_current = os.path.abspath(os.path.join(INVOCATION_DIR, path))
+    if os.path.exists(in_current):
+        return in_current
+
+    in_root = os.path.abspath(os.path.join(ROOT, path))
+    if os.path.exists(in_root):
+        return in_root
+
+    return in_current
+
+
+def looks_like_image_argument(value):
+    """Whether a positional token refers to an input image rather than prompt text."""
+    if not value:
+        return False
+    expanded = os.path.expandvars(os.path.expanduser(value))
+    if os.path.splitext(expanded)[1].lower() in IMAGE_EXTENSIONS:
+        return True
+    return os.path.isfile(resolve_input_path(value))
+
+
+def find_image_in_current_folder():
+    """Return the most recently modified image in the invocation folder, if any."""
+    try:
+        names = os.listdir(INVOCATION_DIR)
+    except OSError:
+        return None
+    images = [
+        os.path.join(INVOCATION_DIR, name)
+        for name in names
+        if name.lower().endswith(IMAGE_EXTENSIONS)
+        and os.path.isfile(os.path.join(INVOCATION_DIR, name))
+    ]
+    if not images:
+        return None
+    return max(images, key=os.path.getmtime)
 
 
 outputs_folder = os.path.join(ROOT, "outputs")
@@ -505,9 +567,17 @@ def run_generation(
 
 def main():
     parser = argparse.ArgumentParser(description="FramePack CLI")
-    parser.add_argument("prompt", nargs="?", help="Text prompt to generate a video from.")
+    parser.add_argument(
+        "positional", nargs="*", metavar="ARG",
+        help="Prompt text and/or input image path. The image may be given here "
+             "in either order instead of with --input/-i.",
+    )
     parser.add_argument("--prompt", dest="prompt_opt", default=None, help="Text prompt (alternative to positional).")
-    parser.add_argument("--input", "-i", required=True, help="Input image path.")
+    parser.add_argument(
+        "--input", "-i", default=None,
+        help="Input image path (absolute or relative to the current folder). "
+             "If omitted, the most recent image in the current folder is used.",
+    )
     parser.add_argument("--negative", default="", help="Negative prompt.")
     parser.add_argument("--output", default=None, help="Explicit output file path.")
     parser.add_argument("--seed", type=int, default=31337, help="Random seed.")
@@ -523,14 +593,51 @@ def main():
     parser.add_argument("--crf", type=int, default=16, help="MP4 CRF (lower = better quality).")
     args = parser.parse_args()
 
-    prompt = args.prompt_opt if args.prompt_opt is not None else args.prompt
+    # Accept the image either as a positional argument (in either order relative
+    # to the prompt) or via --input/-i, as in:
+    #   framepack-cli.py image.png "big waves crashing"
+    #   framepack-cli.py "big waves crashing" image.png
+    image_args = [a for a in args.positional if looks_like_image_argument(a)]
+    prompt_args = [a for a in args.positional if not looks_like_image_argument(a)]
+
+    input_arg = args.input
+    if input_arg is not None and image_args:
+        parser.error(
+            f"input image given twice: {image_args[0]!r} as a positional argument "
+            "and --input/-i; use one or the other"
+        )
+    if len(image_args) > 1:
+        parser.error("more than one input image given: " + ", ".join(image_args))
+    if image_args:
+        input_arg = image_args[0]
+
+    prompt_from_positionals = " ".join(prompt_args).strip()
+    if args.prompt_opt is not None:
+        if prompt_from_positionals:
+            parser.error("prompt given twice: pass it either positionally or with --prompt, not both")
+        prompt = args.prompt_opt
+    else:
+        prompt = prompt_from_positionals
+
     if not prompt:
         parser.error("a prompt is required")
 
-    if not os.path.exists(args.input):
-        parser.error(f"input image not found: {args.input}")
+    if input_arg:
+        input_path = resolve_input_path(input_arg)
+    else:
+        input_path = find_image_in_current_folder()
+        if input_path:
+            print(f"No --input given; using image from current folder: {input_path}")
 
-    input_image = np.array(Image.open(args.input).convert("RGB"))
+    if not input_path or not os.path.isfile(input_path):
+        if input_arg:
+            parser.error(f"input image not found: {input_arg} (resolved to {input_path})")
+        parser.error(
+            "no input image found: pass --input/-i or place an image in the "
+            f"current folder ({INVOCATION_DIR})"
+        )
+
+    input_image = np.array(Image.open(input_path).convert("RGB"))
 
     load_models()
 

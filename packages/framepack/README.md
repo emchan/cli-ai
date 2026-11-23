@@ -489,11 +489,22 @@ This folder also contains `framepack-cli.py`, a command-line adaptation of Frame
 /tmp/framepack-cli/bin/python framepack-cli.py "a dancing man" -i input.png
 ```
 
+The input image can also be passed as a positional argument, in either order relative
+to the prompt:
+
+```bash
+python packages/framepack/framepack-cli.py beach.png "big waves crashing before a storm"
+python packages/framepack/framepack-cli.py "big waves crashing before a storm" beach.png
+```
+
+Relative image paths are resolved against the folder you run the command from.
+If no image is given, the most recently modified image in that folder is used.
+
 Outputs are written to `outputs/<prompt>-<seed>.mp4`.
 
 ### Options
 
-- `--input` / `-i`: input image path (required)
+- `--input` / `-i`: input image path (optional; may also be a positional argument in either order; defaults to the newest image in the current folder)
 - `--prompt`: prompt (alternative to positional)
 - `--negative`: negative prompt
 - `--output`: explicit output file path
