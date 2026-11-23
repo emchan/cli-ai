@@ -41,5 +41,8 @@ The port was guided by these user requests:
 - Fooocus's Gradio UI is not started; `gr.Blocks.launch` is patched to a no-op.
 - Generation reuses Fooocus's `AsyncTask` + worker thread, driven to completion by iterating `generate_clicked()`.
 - The process exits with `os._exit(0)` after writing the output to avoid interpreter shutdown crashes from Fooocus's worker threads.
+
+## License
+This is a command-line port of [Fooocus](https://github.com/lllyasviel/Fooocus). Fooocus retains its original license: **GNU General Public License v3.0 (GPL-3.0)**. See the upstream project for full license terms.
 PY
 echo done

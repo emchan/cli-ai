@@ -4,6 +4,8 @@
 
 # FramePack
 
+> **CLI port:** This directory is a command-line port of the original [FramePack](https://github.com/lllyasviel/FramePack) project. FramePack retains its original license; see the upstream project for full license terms.
+
 Official implementation and desktop software for ["Frame Context Packing and Drift Prevention in Next-Frame-Prediction Video Diffusion Models"](https://lllyasviel.github.io/frame_pack_gitpage/).
 
 Links: [**Paper**](https://arxiv.org/abs/2504.12626), [**Project Page**](https://lllyasviel.github.io/frame_pack_gitpage/)

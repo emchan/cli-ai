@@ -1,0 +1,12 @@
+einops>=0.8.2
+einops-exts>=0.0.4
+numpy>=2.2.6
+packaging>=26.0
+safetensors>=0.7.0
+torch==2.7.1
+torchaudio==2.7.1
+tqdm>=4.67.3
+huggingface-hub>=0.36.0
+transformers>=4.57.0
+soundfile>=0.13.1
+accelerate>=1.13.0
