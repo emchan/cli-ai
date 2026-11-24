@@ -11,7 +11,7 @@ Relative image paths are resolved against the folder you run the command from,
 not the folder containing this script. If --input is omitted, the most recently
 modified image in that folder is used.
 
-Generates a video with FramePack and saves it to outputs/<prompt>-<seed>.mp4.
+Generates a video with FramePack and saves it to the current folder as <prompt>-<seed>.mp4.
 """
 import argparse
 import datetime
@@ -372,7 +372,8 @@ def find_image_in_current_folder():
     return max(images, key=os.path.getmtime)
 
 
-outputs_folder = os.path.join(ROOT, "outputs")
+# Output to the folder the CLI was launched from, not the script folder.
+outputs_folder = INVOCATION_DIR
 os.makedirs(outputs_folder, exist_ok=True)
 
 
@@ -753,10 +754,12 @@ def main():
 
     if args.output:
         output_path = args.output
+        if not os.path.isabs(output_path):
+            output_path = os.path.abspath(os.path.join(INVOCATION_DIR, output_path))
     else:
         output_path = os.path.join(outputs_folder, f"{sanitize_filename(prompt)}-{args.seed}.mp4")
 
-    # User requested outputs/<prompt>-<datestamp>.mp4 relative to ROOT; ensure outputs dir.
+    # Ensure the destination directory exists.
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     print(f"Output: {output_path}")
