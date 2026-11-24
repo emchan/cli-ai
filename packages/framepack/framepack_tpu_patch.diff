@@ -1,0 +1,219 @@
+diff --git a/diffusers_helper/memory.py b/diffusers_helper/memory.py
+index 3380c53..3999783 100644
+--- a/diffusers_helper/memory.py
++++ b/diffusers_helper/memory.py
+@@ -4,11 +4,31 @@
+ import torch
+ 
+ 
++def _detect_tpu():
++    """True when PyTorch reports its native `tpu` accelerator."""
++    try:
++        if hasattr(torch, "accelerator") and torch.accelerator.is_available():
++            accelerator = torch.accelerator.current_accelerator()
++            return accelerator is not None and accelerator.type == "tpu"
++    except Exception:
++        pass
++    return False
++
++
++tpu_available = _detect_tpu()
++
+ cpu = torch.device('cpu')
+-gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
++gpu = torch.device('tpu') if tpu_available else torch.device(f'cuda:{torch.cuda.current_device()}')
+ gpu_complete_modules = []
+ 
+ 
++def empty_cache():
++    if tpu_available:
++        torch.accelerator.memory.empty_cache()
++    else:
++        torch.cuda.empty_cache()
++
++
+ class DynamicSwapInstaller:
+     @staticmethod
+     def _install_module(module: torch.nn.Module, **kwargs):
+@@ -22,6 +42,9 @@ class DynamicSwapInstaller:
+                     p = _parameters[name]
+                     if p is None:
+                         return None
++                    target_device = kwargs.get('device')
++                    if target_device is not None and p.device == torch.device(target_device):
++                        return p
+                     if p.__class__ == torch.nn.Parameter:
+                         return torch.nn.Parameter(p.to(**kwargs), requires_grad=p.requires_grad)
+                     else:
+@@ -72,6 +95,15 @@ def get_cuda_free_memory_gb(device=None):
+     if device is None:
+         device = gpu
+ 
++    if tpu_available:
++        # TPU exposes free/total HBM through torch.accelerator instead of
++        # torch.cuda.mem_get_info. Count inactive reserved bytes as available
++        # so the offload thresholds behave like they do on CUDA.
++        free_memory, _ = torch.accelerator.memory.get_memory_info(device)
++        reserved = torch.accelerator.memory.memory_reserved(device)
++        allocated = torch.accelerator.memory.memory_allocated(device)
++        return (free_memory + max(0, reserved - allocated)) / (1024 ** 3)
++
+     memory_stats = torch.cuda.memory_stats(device)
+     bytes_active = memory_stats['active_bytes.all.current']
+     bytes_reserved = memory_stats['reserved_bytes.all.current']
+@@ -86,14 +118,14 @@ def move_model_to_device_with_memory_preservation(model, target_device, preserve
+ 
+     for m in model.modules():
+         if get_cuda_free_memory_gb(target_device) <= preserved_memory_gb:
+-            torch.cuda.empty_cache()
++            empty_cache()
+             return
+ 
+-        if hasattr(m, 'weight'):
++        if m.__dict__.get('_parameters', {}).get('weight') is not None:
+             m.to(device=target_device)
+ 
+     model.to(device=target_device)
+-    torch.cuda.empty_cache()
++    empty_cache()
+     return
+ 
+ 
+@@ -102,14 +134,14 @@ def offload_model_from_device_for_memory_preservation(model, target_device, pres
+ 
+     for m in model.modules():
+         if get_cuda_free_memory_gb(target_device) >= preserved_memory_gb:
+-            torch.cuda.empty_cache()
++            empty_cache()
+             return
+ 
+-        if hasattr(m, 'weight'):
++        if m.__dict__.get('_parameters', {}).get('weight') is not None:
+             m.to(device=cpu)
+ 
+     model.to(device=cpu)
+-    torch.cuda.empty_cache()
++    empty_cache()
+     return
+ 
+ 
+@@ -119,7 +151,7 @@ def unload_complete_models(*args):
+         print(f'Unloaded {m.__class__.__name__} as complete.')
+ 
+     gpu_complete_modules.clear()
+-    torch.cuda.empty_cache()
++    empty_cache()
+     return
+ 
+ 
+diff --git a/diffusers_helper/models/hunyuan_video_packed.py b/diffusers_helper/models/hunyuan_video_packed.py
+index 1cb42ab..3de19ea 100644
+--- a/diffusers_helper/models/hunyuan_video_packed.py
++++ b/diffusers_helper/models/hunyuan_video_packed.py
+@@ -18,16 +18,32 @@ from diffusers_helper.dit_common import LayerNorm
+ from diffusers_helper.utils import zero_module
+ 
+ 
++def _is_tpu_backend():
++    try:
++        if hasattr(torch, "accelerator") and torch.accelerator.is_available():
++            accelerator = torch.accelerator.current_accelerator()
++            return accelerator is not None and accelerator.type == "tpu"
++    except Exception:
++        pass
++    return False
++
++
++IS_TPU = _is_tpu_backend()
+ enabled_backends = []
+ 
+-if torch.backends.cuda.flash_sdp_enabled():
+-    enabled_backends.append("flash")
+-if torch.backends.cuda.math_sdp_enabled():
+-    enabled_backends.append("math")
+-if torch.backends.cuda.mem_efficient_sdp_enabled():
+-    enabled_backends.append("mem_efficient")
+-if torch.backends.cuda.cudnn_sdp_enabled():
+-    enabled_backends.append("cudnn")
++# torch.backends.cuda only controls CUDA's SDPA dispatcher; the native TPU
++# backend picks its own bf16/fp32 SDPA kernels.
++if torch.cuda.is_available():
++    if torch.backends.cuda.flash_sdp_enabled():
++        enabled_backends.append("flash")
++    if torch.backends.cuda.math_sdp_enabled():
++        enabled_backends.append("math")
++    if torch.backends.cuda.mem_efficient_sdp_enabled():
++        enabled_backends.append("mem_efficient")
++    if torch.backends.cuda.cudnn_sdp_enabled():
++        enabled_backends.append("cudnn")
++elif IS_TPU:
++    enabled_backends.append("tpu-sdpa")
+ 
+ print("Currently enabled native sdp backends:", enabled_backends)
+ 
+@@ -57,6 +73,15 @@ except:
+     sageattn_varlen = None
+     sageattn = None
+ 
++if IS_TPU:
++    # These kernels are CUDA-only. PyTorch SDPA is the only fused attention
++    # path available on TPU and is selected by attn_varlen_func below.
++    xformers_attn_func = None
++    flash_attn_varlen_func = None
++    flash_attn_func = None
++    sageattn_varlen = None
++    sageattn = None
++
+ 
+ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
+ 
+@@ -84,7 +109,7 @@ def get_cu_seqlens(text_mask, img_len):
+     text_len = text_mask.sum(dim=1)
+     max_len = text_mask.shape[1] + img_len
+ 
+-    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device="cuda")
++    cu_seqlens = torch.zeros([2 * batch_size + 1], dtype=torch.int32, device=text_mask.device)
+ 
+     for i in range(batch_size):
+         s = text_len[i] + img_len
+@@ -132,6 +157,18 @@ def attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seq
+         x = sageattn_varlen(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+     elif flash_attn_varlen_func is not None:
+         x = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
++    elif IS_TPU:
++        # No CUDA varlen kernel on TPU. q/k/v were flattened to (B*L, H, C);
++        # each (text or image) segment is independent, so run SDPA per segment.
++        x = torch.zeros_like(q)
++        for idx in range(len(cu_seqlens_q) - 1):
++            start = int(cu_seqlens_q[idx].item())
++            end = int(cu_seqlens_q[idx + 1].item())
++            qs = q[start:end].transpose(0, 1).unsqueeze(0)  # (1, H, N, C)
++            ks = k[start:end].transpose(0, 1).unsqueeze(0)
++            vs = v[start:end].transpose(0, 1).unsqueeze(0)
++            attn = torch.nn.functional.scaled_dot_product_attention(qs, ks, vs)  # (1, H, N, C)
++            x[start:end] = attn.squeeze(0).transpose(0, 1)  # (H, N, C) -> (N, H, C)
+     else:
+         raise NotImplementedError('No Attn Installed!')
+ 
+diff --git a/diffusers_helper/utils.py b/diffusers_helper/utils.py
+index 8cd7a0c..55401b9 100644
+--- a/diffusers_helper/utils.py
++++ b/diffusers_helper/utils.py
+@@ -318,6 +318,17 @@ def add_tensors_with_padding(tensor1, tensor2):
+ 
+ 
+ def print_free_mem():
++    try:
++        if hasattr(torch, "accelerator") and torch.accelerator.is_available():
++            accelerator = torch.accelerator.current_accelerator()
++            if accelerator is not None and accelerator.type == "tpu":
++                torch.accelerator.memory.empty_cache()
++                free_mem, total_mem = torch.accelerator.memory.get_memory_info(accelerator)
++                print(f"Free memory: {free_mem / (1024 ** 2):.2f} MB")
++                print(f"Total memory: {total_mem / (1024 ** 2):.2f} MB")
++                return
++    except Exception:
++        pass
+     torch.cuda.empty_cache()
+     free_mem, total_mem = torch.cuda.mem_get_info(0)
+     free_mem_mb = free_mem / (1024 ** 2)

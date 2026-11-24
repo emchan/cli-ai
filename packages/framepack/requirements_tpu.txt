@@ -1,0 +1,17 @@
+# TPU runtime for FramePack. torch/torch_tpu/diffusers/transformers are
+# provided by the TPU image; do not install CUDA wheels here.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch>=2.14
+torchvision>=0.29
+diffusers>=0.43
+transformers>=5.22
+accelerate>=1.15
+safetensors
+einops
+sentencepiece
+scipy
+requests
+torchsde
+pillow
+opencv-python-headless
+av

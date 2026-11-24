@@ -1,2 +1,5 @@
 hf_download
 __pycache__
+packages/fooocus/outputs/
+packages/framepack/outputs/
+beach.png

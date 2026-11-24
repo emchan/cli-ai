@@ -33,6 +33,36 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # this to resolve user-supplied relative image paths against the current folder.
 INVOCATION_DIR = os.getcwd()
 
+
+def is_tpu_backend():
+    """Whether this interpreter sees PyTorch's native `tpu` accelerator.
+
+    CLI_AI_BACKEND=tpu/native-tpu forces the TPU path; cuda/rocm/cpu forces the
+    original CUDA path.
+    """
+    backend = os.environ.get("CLI_AI_BACKEND", "").lower()
+    if backend in ("tpu", "native-tpu", "torch-tpu"):
+        return True
+    if backend in ("cuda", "rocm", "cpu", "nvidia"):
+        return False
+    try:
+        import torch
+        if hasattr(torch, "accelerator") and torch.accelerator.is_available():
+            accelerator = torch.accelerator.current_accelerator()
+            return accelerator is not None and accelerator.type == "tpu"
+    except Exception:
+        pass
+    return False
+
+
+TPU_AVAILABLE = is_tpu_backend()
+if TPU_AVAILABLE:
+    # Use the pre-installed torch_tpu stack instead of building a CUDA venv.
+    os.environ["FRAMEPACK_CLI_SKIP_VENV"] = "1"
+
+# Set to torch.bfloat16 on TPU once torch has been imported below.
+INFERENCE_DTYPE = None
+
 # ---------------------------------------------------------------------------
 # Self-bootstrapping environment (conda/Miniforge preferred; venv fallback).
 # ---------------------------------------------------------------------------
@@ -201,6 +231,38 @@ if os.environ.get("FRAMEPACK_CLI_SKIP_VENV") != "1":
             os.environ.setdefault("FRAMEPACK_CLI_BOOTSTRAPPED", "1")
             os.execv(_framepack_venv_python, [_framepack_venv_python] + sys.argv)
 
+
+def ensure_tpu_requirements():
+    """Install the TPU-safe FramePack extras into the torch_tpu interpreter."""
+    import importlib
+
+    modules = (
+        "torch", "torchvision", "diffusers", "transformers", "accelerate",
+        "safetensors", "einops", "sentencepiece", "scipy", "requests",
+        "torchsde", "PIL", "cv2", "av",
+    )
+    missing = []
+    for name in modules:
+        try:
+            importlib.import_module(name)
+        except Exception:
+            missing.append(name)
+    if not missing:
+        return
+    print(f"Installing TPU-safe FramePack dependencies (missing: {', '.join(missing)}) ...", flush=True)
+    req = os.path.join(SCRIPT_DIR, "requirements_tpu.txt")
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "-r", req],
+            check=True,
+        )
+    except Exception as e:
+        print(f"Warning: pip install failed: {e}", flush=True)
+
+
+if TPU_AVAILABLE and os.environ.get("FRAMEPACK_TPU_SKIP_PIP_INSTALL") != "1":
+    ensure_tpu_requirements()
+
 # Script/output root.
 ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT)
@@ -208,16 +270,21 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 # FramePack source (diffusers_helper, ...) is not vendored; fetch on demand.
+# The TPU patch gets a separate cache dir so a CUDA checkout is never patched.
 SOURCE_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "framepack-src")
 SOURCE_REPO = "https://github.com/lllyasviel/FramePack"
+SOURCE_DIR = "FramePack-TPU" if TPU_AVAILABLE else "FramePack"
+TPU_PATCH = os.path.join(SCRIPT_DIR, "framepack_tpu_patch.diff")
 
 
 def ensure_framepack_source():
-    candidates = [ROOT, "/tmp/FramePack", os.path.join(SOURCE_CACHE, "FramePack")]
+    candidates = [os.path.join(SOURCE_CACHE, SOURCE_DIR)]
+    if not TPU_AVAILABLE:
+        candidates = [ROOT, "/tmp/FramePack"] + candidates
     for cand in candidates:
         if os.path.isdir(os.path.join(cand, "diffusers_helper")):
             return cand
-    dest = os.path.join(SOURCE_CACHE, "FramePack")
+    dest = os.path.join(SOURCE_CACHE, SOURCE_DIR)
     os.makedirs(SOURCE_CACHE, exist_ok=True)
     if os.path.exists(dest):
         shutil.rmtree(dest)
@@ -229,7 +296,31 @@ def ensure_framepack_source():
     return dest
 
 
+def apply_tpu_patch(source_root):
+    """Apply the local TPU backend patch to diffusers_helper (idempotent)."""
+    if not os.path.isfile(TPU_PATCH):
+        raise RuntimeError(f"FramePack TPU patch not found: {TPU_PATCH}")
+    marker = os.path.join(source_root, "diffusers_helper", "memory.py")
+    if os.path.isfile(marker):
+        with open(marker, encoding="utf-8", errors="replace") as handle:
+            if "tpu_available = _detect_tpu()" in handle.read():
+                return  # already patched
+    check = subprocess.run(
+        ["git", "apply", "--check", TPU_PATCH], cwd=source_root,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if check.returncode != 0:
+        raise RuntimeError(
+            "FramePack TPU patch does not apply to the cached source.\n"
+            + check.stderr.strip()
+        )
+    print("Applying FramePack TPU patch ...", flush=True)
+    subprocess.run(["git", "apply", TPU_PATCH], cwd=source_root, check=True)
+
+
 SOURCE_ROOT = ensure_framepack_source()
+if TPU_AVAILABLE:
+    apply_tpu_patch(SOURCE_ROOT)
 if SOURCE_ROOT not in sys.path:
     sys.path.insert(0, SOURCE_ROOT)
 
@@ -241,7 +332,21 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(HF_DOWNLOADS, "hub")
 
 import numpy as np
 import torch
+if TPU_AVAILABLE:
+    INFERENCE_DTYPE = torch.bfloat16
+else:
+    INFERENCE_DTYPE = None  # keep each model's current dtype on CUDA
 import torchvision.io
+
+# FramePack's dit_common imports `LayerNorm` from diffusers.models.normalization,
+# which was removed in diffusers >= 0.35. The upstream class is the same as
+# torch.nn.LayerNorm, so restore the alias for newer TPU images.
+try:
+    import diffusers.models.normalization as _diffusers_norm
+    if not hasattr(_diffusers_norm, "LayerNorm"):
+        _diffusers_norm.LayerNorm = torch.nn.LayerNorm
+except Exception:
+    pass
 from PIL import Image
 
 from diffusers import AutoencoderKLHunyuanVideo
@@ -439,16 +544,18 @@ def load_models():
     print(f"Free VRAM {free_mem_gb} GB")
     print(f"High-VRAM Mode: {high_vram}")
 
-    text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder", torch_dtype=torch.float16).cpu()
-    text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder_2", torch_dtype=torch.float16).cpu()
+    dtype = INFERENCE_DTYPE or torch.float16
+    transformer_dtype = INFERENCE_DTYPE or torch.bfloat16
+    text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder", torch_dtype=dtype).cpu()
+    text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder_2", torch_dtype=dtype).cpu()
     tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer_2")
-    vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=torch.float16).cpu()
+    vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=dtype).cpu()
 
     feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="feature_extractor")
-    image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="image_encoder", torch_dtype=torch.float16).cpu()
+    image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="image_encoder", torch_dtype=dtype).cpu()
 
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained("lllyasviel/FramePackI2V_HY", torch_dtype=torch.bfloat16).cpu()
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained("lllyasviel/FramePackI2V_HY", torch_dtype=transformer_dtype).cpu()
 
     vae.eval()
     text_encoder.eval()
@@ -463,11 +570,11 @@ def load_models():
     transformer.high_quality_fp32_output_for_inference = True
     print("transformer.high_quality_fp32_output_for_inference = True")
 
-    transformer.to(dtype=torch.bfloat16)
-    vae.to(dtype=torch.float16)
-    image_encoder.to(dtype=torch.float16)
-    text_encoder.to(dtype=torch.float16)
-    text_encoder_2.to(dtype=torch.float16)
+    transformer.to(dtype=transformer_dtype)
+    vae.to(dtype=dtype)
+    image_encoder.to(dtype=dtype)
+    text_encoder.to(dtype=dtype)
+    text_encoder_2.to(dtype=dtype)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -476,9 +583,16 @@ def load_models():
     transformer.requires_grad_(False)
 
     if not high_vram:
+        # Keep the largest models on CPU and swap individual layers onto the
+        # accelerator. The TPU only has ~16 GiB HBM, so we cannot keep the
+        # transformer, text encoders, VAE and image encoder resident together.
         DynamicSwapInstaller.install_model(transformer, device=gpu)
         DynamicSwapInstaller.install_model(text_encoder, device=gpu)
         _keep_output_capture_on_swapped_model(text_encoder)
+        if not TPU_AVAILABLE:
+            text_encoder_2.to(gpu)
+            image_encoder.to(gpu)
+            vae.to(gpu)
     else:
         text_encoder.to(gpu)
         text_encoder_2.to(gpu)
@@ -506,13 +620,14 @@ def run_generation(
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
+    dynamic_swap = not high_vram
     try:
-        if not high_vram:
+        if dynamic_swap:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
 
         # Text encoding
         print("Text encoding ...")
-        if not high_vram:
+        if dynamic_swap:
             fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
@@ -537,14 +652,14 @@ def run_generation(
 
         # VAE encoding
         print("VAE encoding ...")
-        if not high_vram:
+        if dynamic_swap:
             load_model_as_complete(vae, target_device=gpu)
 
         start_latent = vae_encode(input_image_pt, vae)
 
         # CLIP Vision
         print("CLIP Vision encoding ...")
-        if not high_vram:
+        if dynamic_swap:
             load_model_as_complete(image_encoder, target_device=gpu)
 
         image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
@@ -585,7 +700,7 @@ def run_generation(
             clean_latents_post, clean_latents_2x, clean_latents_4x = history_latents[:, :, :1 + 2 + 16, :, :].split([1, 2, 16], dim=2)
             clean_latents = torch.cat([clean_latents_pre, clean_latents_post], dim=2)
 
-            if not high_vram:
+            if dynamic_swap:
                 unload_complete_models()
                 move_model_to_device_with_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=gpu_memory_preservation)
 
@@ -618,7 +733,7 @@ def run_generation(
                 negative_prompt_embeds_mask=llama_attention_mask_n,
                 negative_prompt_poolers=clip_l_pooler_n,
                 device=gpu,
-                dtype=torch.bfloat16,
+                dtype=INFERENCE_DTYPE or torch.bfloat16,
                 image_embeddings=image_encoder_last_hidden_state,
                 latent_indices=latent_indices,
                 clean_latents=clean_latents,
@@ -637,7 +752,7 @@ def run_generation(
             total_generated_latent_frames += int(generated_latents.shape[2])
             history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
 
-            if not high_vram:
+            if dynamic_swap:
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
                 load_model_as_complete(vae, target_device=gpu)
 
@@ -652,7 +767,7 @@ def run_generation(
                 current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
-            if not high_vram:
+            if dynamic_swap:
                 unload_complete_models()
 
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
@@ -663,11 +778,11 @@ def run_generation(
                 break
     except Exception:
         traceback.print_exc()
-        if not high_vram:
+        if dynamic_swap:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
         raise
     finally:
-        if not high_vram:
+        if dynamic_swap:
             try:
                 unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
             except Exception:

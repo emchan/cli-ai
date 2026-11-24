@@ -1,0 +1,34 @@
+# TPU-safe Fooocus dependencies (torch_tpu image: torch 2.14.1+, Python 3.13+)
+# Do NOT use requirements_versions.txt here: its CUDA-era pins replace NumPy
+# and break the pre-installed torch_tpu stack. Mirrors portpilot's
+# fooocus/Google_TPU launcher. fooocus-cli.py installs these in groups:
+# opencv-python-headless and gradio/gradio-client are installed with --no-deps.
+
+# Sampling / preprocessors
+torchsde==0.2.6
+trampoline
+opencv-python-headless
+
+supervision
+timm
+pycocotools
+addict
+segment-anything
+groundingdino-py
+onnxruntime
+rembg
+
+# Gradio 3.41.2 + the web stack it expects (numpy 2 aliases are added at runtime)
+gradio==3.41.2
+gradio-client==0.5.0
+
+fastapi==0.104.1
+starlette==0.27.0
+pydantic==2.9.2
+websockets==11.0.3
+
+ffmpy
+pydub
+semantic-version
+orjson
+importlib-resources
