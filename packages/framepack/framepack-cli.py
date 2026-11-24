@@ -33,6 +33,12 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # this to resolve user-supplied relative image paths against the current folder.
 INVOCATION_DIR = os.getcwd()
 
+# ROCm / WSL2 environment must be set before any torch import/subprocess.
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+os.environ.setdefault("ROCPROFILER_REGISTER_ENABLED", "0")
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
+os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
 
 def is_tpu_backend():
     """Whether this interpreter sees PyTorch's native `tpu` accelerator.
@@ -66,7 +72,7 @@ INFERENCE_DTYPE = None
 # ---------------------------------------------------------------------------
 # Self-bootstrapping environment (conda/Miniforge preferred; venv fallback).
 # ---------------------------------------------------------------------------
-FRAMEPACK_VENV_DIR = os.environ.get("FRAMEPACK_VENV", os.path.expanduser("~/cli-ai/framepack-cli"))
+FRAMEPACK_VENV_DIR = os.environ.get("FRAMEPACK_VENV", os.path.expanduser("~/cli-ai/framepack-cli-uv"))
 
 
 def _find_fp311_site_packages():
@@ -111,7 +117,7 @@ def _venv_site_packages(prefix):
 def _venv_ok(python):
     try:
         subprocess.run(
-            [python, "-c", "import torch, diffusers, transformers"],
+            [python, "-c", "import torch, diffusers, transformers; import sys; sys.exit(0 if getattr(torch.version, 'hip', None) else 1)"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=True,
@@ -124,18 +130,30 @@ def _venv_ok(python):
 
 def _install_requirements(python):
     req_candidates = [
+        os.path.join(SCRIPT_DIR, "requirements_rocm.txt"),
         os.path.join(SCRIPT_DIR, "requirements.txt"),
-        "/tmp/FramePack/requirements.txt",
-        os.path.join(os.path.expanduser("~"), ".cache", "framepack-src", "FramePack", "requirements.txt"),
     ]
     for req in req_candidates:
         if os.path.exists(req):
             try:
                 subprocess.run(
                     [python, "-m", "pip", "install", "-r", req,
-                     "--extra-index-url", "https://download.pytorch.org/whl/cu126"],
-                    check=False,
+                     "--extra-index-url", "https://download.pytorch.org/whl/rocm7.2"],
+                    check=True,
                 )
+                # Ensure a ROCm build of torch/torchvision is present.
+                try:
+                    subprocess.run(
+                        [python, "-c", "import torch,sys; sys.exit(0 if getattr(torch.version,'hip',None) else 1)"],
+                        check=True,
+                    )
+                except Exception:
+                    subprocess.run(
+                        [python, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+                         "torch", "torchvision",
+                         "--index-url", "https://download.pytorch.org/whl/rocm7.2"],
+                        check=True,
+                    )
             except Exception as e:
                 print(f"pip install failed: {e}", flush=True)
             return
@@ -221,6 +239,8 @@ if os.environ.get("FRAMEPACK_CLI_SKIP_VENV") != "1":
         import torch  # noqa: F401
         import diffusers  # noqa: F401
         import transformers  # noqa: F401
+        if not getattr(torch.version, "hip", None):
+            raise RuntimeError("not a ROCm build")
 
         _framepack_deps_present = True
     except Exception:
@@ -337,6 +357,20 @@ if TPU_AVAILABLE:
 else:
     INFERENCE_DTYPE = None  # keep each model's current dtype on CUDA
 import torchvision.io
+
+# Optional torchao quantization.
+try:
+    from torchao.quantization import quantize_ as _torchao_quantize
+    from torchao.quantization import Float8WeightOnlyConfig as _Float8Cfg
+    from torchao.quantization import Int8WeightOnlyConfig as _Int8Cfg
+    from torchao.quantization import IntxWeightOnlyConfig as _IntxCfg
+    from torchao.quantization.quant_api import _is_linear as _torchao_is_linear
+    from torchao.quantization.transform_module import _QUANTIZE_CONFIG_HANDLER as _TORCHAO_HANDLER
+    TORCHAO_AVAILABLE = True
+except Exception:
+    TORCHAO_AVAILABLE = False
+    _torchao_is_linear = None
+    _TORCHAO_HANDLER = None
 
 # FramePack's dit_common imports `LayerNorm` from diffusers.models.normalization,
 # which was removed in diffusers >= 0.35. The upstream class is the same as
@@ -533,6 +567,30 @@ def _memory_efficient_attention_on_older_gpus():
         F.scaled_dot_product_attention = original_sdpa
 
 
+def _quantize_transformer_memory_efficient(transformer, cfg):
+    if not TORCHAO_AVAILABLE:
+        return
+    handler = _TORCHAO_HANDLER[type(cfg)]
+    target_names = [name for name, mod in transformer.named_modules() if name and _torchao_is_linear(mod)]
+    total = len(target_names)
+    for idx, fqn in enumerate(target_names, 1):
+        parts = fqn.split(".")
+        parent = transformer
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        attr = parts[-1]
+        mod = getattr(parent, attr)
+        new_mod = handler(mod, cfg)
+        setattr(parent, attr, new_mod)
+        del mod, new_mod
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if idx % 50 == 0 or idx == total:
+            print(f"  quantized {idx}/{total} linear modules", flush=True)
+
+
 def load_models():
     global free_mem_gb, high_vram
     global text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae
@@ -546,16 +604,16 @@ def load_models():
 
     dtype = INFERENCE_DTYPE or torch.float16
     transformer_dtype = INFERENCE_DTYPE or torch.bfloat16
-    text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder", torch_dtype=dtype).cpu()
-    text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder_2", torch_dtype=dtype).cpu()
+    text_encoder = LlamaModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder", torch_dtype=dtype, low_cpu_mem_usage=True).cpu()
+    text_encoder_2 = CLIPTextModel.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="text_encoder_2", torch_dtype=dtype, low_cpu_mem_usage=True).cpu()
     tokenizer = LlamaTokenizerFast.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer")
     tokenizer_2 = CLIPTokenizer.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="tokenizer_2")
-    vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=dtype).cpu()
+    vae = AutoencoderKLHunyuanVideo.from_pretrained("hunyuanvideo-community/HunyuanVideo", subfolder="vae", torch_dtype=dtype, low_cpu_mem_usage=True).cpu()
 
     feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="feature_extractor")
-    image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="image_encoder", torch_dtype=dtype).cpu()
+    image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="image_encoder", torch_dtype=dtype, low_cpu_mem_usage=True).cpu()
 
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained("lllyasviel/FramePackI2V_HY", torch_dtype=transformer_dtype).cpu()
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained("lllyasviel/FramePackI2V_HY", torch_dtype=transformer_dtype, low_cpu_mem_usage=True).cpu()
 
     vae.eval()
     text_encoder.eval()
@@ -567,14 +625,20 @@ def load_models():
         vae.enable_slicing()
         vae.enable_tiling()
 
-    transformer.high_quality_fp32_output_for_inference = True
-    print("transformer.high_quality_fp32_output_for_inference = True")
+    transformer.high_quality_fp32_output_for_inference = False
+    print("transformer.high_quality_fp32_output_for_inference = False")
 
     transformer.to(dtype=transformer_dtype)
     vae.to(dtype=dtype)
     image_encoder.to(dtype=dtype)
     text_encoder.to(dtype=dtype)
     text_encoder_2.to(dtype=dtype)
+
+    # Quantize transformer to fp8 (weight-only) to reduce memory on iGPU.
+    if TORCHAO_AVAILABLE:
+        print("Quantizing transformer to int4 (weight-only) ...", flush=True)
+        _quantize_transformer_memory_efficient(transformer, _IntxCfg(weight_dtype=torch.int4))
+        print("Transformer quantization done.", flush=True)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -813,7 +877,7 @@ def main():
     parser.add_argument("--cfg", type=float, default=1.0, help="CFG scale.")
     parser.add_argument("--gs", type=float, default=10.0, help="Distilled CFG scale.")
     parser.add_argument("--rs", type=float, default=0.0, help="CFG re-scale.")
-    parser.add_argument("--gpu-memory-preservation", type=float, default=6.0, help="GPU memory preservation (GB).")
+    parser.add_argument("--gpu-memory-preservation", type=float, default=12.0, help="GPU memory preservation (GB).")
     parser.add_argument("--teacache", action="store_true", default=True, help="Use TeaCache.")
     parser.add_argument("--no-teacache", dest="teacache", action="store_false", help="Disable TeaCache.")
     parser.add_argument("--crf", type=int, default=16, help="MP4 CRF (lower = better quality).")
