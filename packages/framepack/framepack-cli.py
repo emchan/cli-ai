@@ -241,6 +241,7 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(HF_DOWNLOADS, "hub")
 
 import numpy as np
 import torch
+import torchvision.io
 from PIL import Image
 
 from diffusers import AutoencoderKLHunyuanVideo
@@ -265,6 +266,61 @@ def sanitize_filename(text: str) -> str:
 
 
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff")
+
+
+def _save_bcthw_as_mp4(x, output_filename, fps=30, crf=16):
+    """Save a BCTHW video tensor, falling back to ffmpeg on newer torchvision.
+
+    torchvision >= 0.29 no longer exposes ``io.write_video``, which upstream
+    FramePack still calls. Keep using the upstream helper when it is available
+    and otherwise write raw RGB frames straight to ffmpeg via a pipe.
+    """
+    if hasattr(torchvision.io, "write_video"):
+        return save_bcthw_as_mp4(x, output_filename, fps=fps, crf=crf)
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_filename)), exist_ok=True)
+    x = torch.clamp(x.float(), -1.0, 1.0) * 127.5 + 127.5
+    x = x.detach().cpu().to(torch.uint8)
+
+    b, _c, t, h, w = x.shape
+    per_row = b
+    for p in (6, 5, 4, 3, 2):
+        if b % p == 0:
+            per_row = p
+            break
+    rows = b // per_row
+
+    # (rows, per_row, c, t, h, w) -> (t, rows*h, per_row*w, c)
+    frames = x.reshape(rows, per_row, x.shape[1], t, h, w)
+    frames = frames.permute(3, 0, 4, 1, 5, 2).reshape(t, rows * h, per_row * w, x.shape[1])
+    frames = frames.contiguous().numpy()
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to save videos with this torchvision version")
+
+    out_h, out_w = frames.shape[1], frames.shape[2]
+    cmd = [
+        ffmpeg, "-y", "-loglevel", "error",
+        "-f", "rawvideo", "-pix_fmt", "rgb24",
+        "-s", f"{out_w}x{out_h}", "-r", str(fps), "-i", "pipe:0",
+        "-an", "-c:v", "libx264", "-crf", str(int(crf)),
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-pix_fmt", "yuv420p",
+        output_filename,
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+    try:
+        proc.stdin.write(frames.tobytes())
+        proc.stdin.close()
+        if proc.wait() != 0:
+            raise RuntimeError(f"ffmpeg failed with exit code {proc.returncode}")
+    except Exception:
+        if proc.stdin and not proc.stdin.closed:
+            proc.stdin.close()
+        proc.wait()
+        raise
+    return output_filename
 
 
 def resolve_input_path(path):
@@ -599,7 +655,7 @@ def run_generation(
                 unload_complete_models()
 
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
-            save_bcthw_as_mp4(history_pixels, output_path, fps=30, crf=mp4_crf)
+            _save_bcthw_as_mp4(history_pixels, output_path, fps=30, crf=mp4_crf)
             print(f"Saved {output_path} (latent frames: {total_generated_latent_frames})")
 
             if is_last_section:
@@ -608,6 +664,7 @@ def run_generation(
         traceback.print_exc()
         if not high_vram:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
+        raise
     finally:
         if not high_vram:
             try:
