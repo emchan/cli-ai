@@ -81,15 +81,29 @@ else:
                 print(f"conda/mamba env creation failed: {e}", flush=True)
                 os.environ["FOOOCUS_NO_VENV"] = "1"
         if os.environ.get("FOOOCUS_NO_VENV") != "1" and os.path.exists(env_py):
-            req = os.path.join(SCRIPT_DIR, "requirements_original.txt")
+            req = os.path.join(SCRIPT_DIR, "requirements_rocm.txt")
             if os.path.exists(req) and os.environ.get("FOOOCUS_SKIP_PIP_INSTALL") != "1":
                 print("Installing requirements into conda env ...", flush=True)
                 try:
+                    # Install ROCm-compatible dependencies.
                     subprocess.run(
                         [env_py, "-m", "pip", "install", "-r", req,
-                         "--extra-index-url", "https://download.pytorch.org/whl/cu121"],
+                         "--extra-index-url", "https://download.pytorch.org/whl/rocm7.2"],
                         check=True,
                     )
+                    # Ensure a ROCm build of torch/torchvision is present.
+                    try:
+                        subprocess.run(
+                            [env_py, "-c", "import torch,sys; sys.exit(0 if getattr(torch.version,'hip',None) else 1)"],
+                            check=True,
+                        )
+                    except Exception:
+                        subprocess.run(
+                            [env_py, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+                             "torch", "torchvision",
+                             "--index-url", "https://download.pytorch.org/whl/rocm7.2"],
+                            check=True,
+                        )
                 except Exception as e:
                     print(f"pip install in conda env failed: {e}", flush=True)
             os.execv(env_py, [env_py] + sys.argv)
@@ -118,19 +132,32 @@ else:
                     os.environ["FOOOCUS_NO_VENV"] = "1"
             if os.environ.get("FOOOCUS_NO_VENV") != "1" and os.path.exists(venv_python):
                 pip = os.path.join(VENV_DIR, "bin", "pip")
-                req = os.path.join(SCRIPT_DIR, "requirements_original.txt")
+                req = os.path.join(SCRIPT_DIR, "requirements_rocm.txt")
                 if os.path.exists(req):
                     print("Installing requirements into venv ...", flush=True)
                     subprocess.run(
                         [pip, "install", "-r", req,
-                         "--extra-index-url", "https://download.pytorch.org/whl/cu121"],
+                         "--extra-index-url", "https://download.pytorch.org/whl/rocm7.2"],
+                        check=True,
+                    )
+                # Ensure a ROCm build of torch/torchvision is present.
+                try:
+                    subprocess.run(
+                        [venv_python, "-c", "import torch,sys; sys.exit(0 if getattr(torch.version,'hip',None) else 1)"],
+                        check=True,
+                    )
+                except Exception:
+                    subprocess.run(
+                        [pip, "install", "--force-reinstall", "--no-deps",
+                         "torch", "torchvision",
+                         "--index-url", "https://download.pytorch.org/whl/rocm7.2"],
                         check=True,
                     )
                 os.execv(venv_python, [venv_python] + sys.argv)
 
 # If venv was skipped/unavailable, optionally install requirements into current env.
 if os.environ.get("FOOOCUS_NO_VENV") == "1":
-    req = os.path.join(SCRIPT_DIR, "requirements_original.txt")
+    req = os.path.join(SCRIPT_DIR, "requirements_rocm.txt")
     if os.path.exists(req) and os.environ.get("FOOOCUS_SKIP_PIP_INSTALL") != "1":
         try:
             import importlib.util
@@ -143,7 +170,20 @@ if os.environ.get("FOOOCUS_NO_VENV") == "1":
                 print("Installing requirements into current Python (FOOOCUS_NO_VENV=1) ...", flush=True)
                 subprocess.run(
                     [sys.executable, "-m", "pip", "install", "-r", req,
-                     "--extra-index-url", "https://download.pytorch.org/whl/cu121"],
+                     "--extra-index-url", "https://download.pytorch.org/whl/rocm7.2"],
+                    check=True,
+                )
+            # Ensure a ROCm build of torch/torchvision is present.
+            try:
+                subprocess.run(
+                    [sys.executable, "-c", "import torch,sys; sys.exit(0 if getattr(torch.version,'hip',None) else 1)"],
+                    check=True,
+                )
+            except Exception:
+                subprocess.run(
+                    [sys.executable, "-m", "pip", "install", "--force-reinstall", "--no-deps",
+                     "torch", "torchvision",
+                     "--index-url", "https://download.pytorch.org/whl/rocm7.2"],
                     check=True,
                 )
         except Exception as e:
@@ -163,7 +203,14 @@ _parser.add_argument(
 CLI_ARGS = _parser.parse_args()
 
 # Prevent Fooocus's argument parser from choking on our positional prompt.
-sys.argv = [sys.argv[0]]
+# ROCm / WSL2: make the Radeon 780M usable.
+os.environ.setdefault("HSA_OVERRIDE_GFX_VERSION", "11.0.0")
+os.environ.setdefault("ROCPROFILER_REGISTER_ENABLED", "0")
+os.environ.setdefault("HIP_VISIBLE_DEVICES", "0")
+os.environ.setdefault("MIOPEN_FIND_MODE", "FAST")
+
+# Disable xformers (not available on ROCm) and keep Fooocus from parsing our args.
+sys.argv = [sys.argv[0], "--disable-xformers"]
 
 # Fooocus source is not vendored; fetch on demand.
 SOURCE_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "fooocus-src")
@@ -204,6 +251,16 @@ os.environ.setdefault("HUGGINGFACE_HUB_CACHE", os.path.join(HF_DOWNLOADS, "hub")
 import gradio as gr
 
 gr.Blocks.launch = lambda self, *a, **k: None
+
+# ROCm: configure Fooocus for the iGPU before it reads its args.
+try:
+    import ldm_patched.modules.args_parser as _fooocus_args  # noqa: E402
+    _fooocus_args.args.disable_xformers = True
+    _fooocus_args.args.attention_pytorch = True
+    _fooocus_args.args.vae_in_fp16 = True
+    _fooocus_args.args.always_low_vram = True
+except Exception:
+    pass
 
 import webui  # noqa: E402  (triggers model loading / downloads)
 import modules.config  # noqa: E402
