@@ -25,6 +25,10 @@ import math
 import shutil
 import subprocess
 import glob
+import tempfile
+import hashlib
+import threading
+import time
 
 # Script/output root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -366,11 +370,16 @@ try:
     from torchao.quantization import IntxWeightOnlyConfig as _IntxCfg
     from torchao.quantization.quant_api import _is_linear as _torchao_is_linear
     from torchao.quantization.transform_module import _QUANTIZE_CONFIG_HANDLER as _TORCHAO_HANDLER
+    try:
+        from torchao.prototype._nf4tensor_api import NF4WeightOnlyConfig as _NF4_WEIGHT_ONLY_CONFIG
+    except Exception:
+        _NF4_WEIGHT_ONLY_CONFIG = None
     TORCHAO_AVAILABLE = True
 except Exception:
     TORCHAO_AVAILABLE = False
     _torchao_is_linear = None
     _TORCHAO_HANDLER = None
+    _NF4_WEIGHT_ONLY_CONFIG = None
 
 # FramePack's dit_common imports `LayerNorm` from diffusers.models.normalization,
 # which was removed in diffusers >= 0.35. The upstream class is the same as
@@ -567,35 +576,175 @@ def _memory_efficient_attention_on_older_gpus():
         F.scaled_dot_product_attention = original_sdpa
 
 
-def _quantize_transformer_memory_efficient(transformer, cfg):
+def _quantize_transformer_memory_efficient(
+    transformer, cfg, completed_fqns=None, checkpoint_path=None
+):
     if not TORCHAO_AVAILABLE:
-        return
+        return list(completed_fqns or [])
+
     handler = _TORCHAO_HANDLER[type(cfg)]
     target_names = [name for name, mod in transformer.named_modules() if name and _torchao_is_linear(mod)]
     total = len(target_names)
+
+    completed = list(completed_fqns or [])
+    completed_set = set(completed)
+
     for idx, fqn in enumerate(target_names, 1):
+        if fqn in completed_set:
+            if idx % 50 == 0 or idx == total:
+                print(f"  already quantized {idx}/{total} linear modules", flush=True)
+            continue
+
         parts = fqn.split(".")
         parent = transformer
         for p in parts[:-1]:
             parent = getattr(parent, p)
         attr = parts[-1]
         mod = getattr(parent, attr)
+        old_weight = getattr(mod, "weight", None)
+        if isinstance(old_weight, torch.nn.Parameter):
+            old_weight = old_weight.detach()
+
         new_mod = handler(mod, cfg)
         setattr(parent, attr, new_mod)
-        del mod, new_mod
+
+        # Drop references to the original (unquantized) tensor as soon as the
+        # quantized replacement is in place so it can be collected promptly.
+        if old_weight is not None:
+            del old_weight
+        del mod, new_mod, parent, parts, attr
         import gc
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        completed.append(fqn)
+        completed_set.add(fqn)
+
+        # Periodically checkpoint the partial quantized state so a crash can
+        # resume from the last completed module instead of starting over.
+        if checkpoint_path is not None and (len(completed) % 50 == 0 or idx == total):
+            try:
+                _tmp_checkpoint = checkpoint_path + ".tmp"
+                torch.save(
+                    {"completed": completed, "state_dict": transformer.state_dict()},
+                    _tmp_checkpoint,
+                )
+                os.replace(_tmp_checkpoint, checkpoint_path)
+                print(
+                    f"  checkpoint saved: {len(completed)}/{total} linear modules",
+                    flush=True,
+                )
+            except Exception as e:
+                print(f"  Warning: could not save quantization checkpoint: {e}", flush=True)
+                try:
+                    if os.path.exists(_tmp_checkpoint):
+                        os.remove(_tmp_checkpoint)
+                except OSError:
+                    pass
+
         if idx % 50 == 0 or idx == total:
             print(f"  quantized {idx}/{total} linear modules", flush=True)
 
+    return completed
 
-def load_models():
+
+def _quant_cache_path(transformer_dtype, quant_mode="int4"):
+    """Path for the cached, quantized transformer in the temp folder."""
+    key = "|".join([
+        "lllyasviel/FramePackI2V_HY",
+        str(transformer_dtype),
+        f"{quant_mode}-weight-only",
+        torch.__version__,
+    ])
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:16]
+    return os.path.join(QUANT_CACHE_DIR, f"transformer-{quant_mode}-{digest}.pt")
+
+
+QUANT_CACHE_DIR = os.environ.get(
+    "FRAMEPACK_QUANT_CACHE",
+    os.path.join(tempfile.gettempdir(), "opencode", "framepack-quant-cache"),
+)
+os.makedirs(QUANT_CACHE_DIR, exist_ok=True)
+
+
+_STATUS_STAGE = "idle"
+_STATUS_STOP = threading.Event()
+_STATUS_THREAD = None
+
+
+def set_status_stage(stage):
+    global _STATUS_STAGE
+    _STATUS_STAGE = str(stage)
+
+
+def _status_bar_loop(interval=5):
+    try:
+        import psutil
+    except Exception:
+        return
+    while not _STATUS_STOP.is_set():
+        try:
+            cpu = psutil.cpu_percent(interval=None)
+            vm = psutil.virtual_memory()
+            mem_used_gb = vm.used / (1024 ** 3)
+            mem_total_gb = vm.total / (1024 ** 3)
+            gpu_str = "n/a"
+            try:
+                import torch
+                if torch.cuda.is_available():
+                    alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+                    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+                    total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    gpu_str = f"{alloc:.1f}/{total:.1f}GB (reserved {reserved:.1f}GB)"
+            except Exception:
+                pass
+            line = (
+                f"\\r[STATUS] stage={_STATUS_STAGE} | CPU {cpu:5.1f}% | "
+                f"RAM {mem_used_gb:.1f}/{mem_total_gb:.1f}GB | GPU VRAM {gpu_str}   "
+            )
+            sys.stderr.write(line)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        _STATUS_STOP.wait(interval)
+    try:
+        sys.stderr.write("\\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+def start_status_bar():
+    global _STATUS_THREAD
+    if _STATUS_THREAD is not None:
+        return
+    _STATUS_STOP.clear()
+    _STATUS_THREAD = threading.Thread(target=_status_bar_loop, daemon=True, name="status-bar")
+    _STATUS_THREAD.start()
+
+
+def stop_status_bar():
+    global _STATUS_THREAD
+    _STATUS_STOP.set()
+    if _STATUS_THREAD is not None:
+        _STATUS_THREAD.join(timeout=3)
+    _STATUS_THREAD = None
+
+
+def load_models(quant_mode=None):
     global free_mem_gb, high_vram
     global text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae
     global feature_extractor, image_encoder, transformer
 
+    if quant_mode is None:
+        quant_mode = "nf4"
+    quant_mode = str(quant_mode).lower()
+    global free_mem_gb, high_vram
+    global text_encoder, text_encoder_2, tokenizer, tokenizer_2, vae
+    global feature_extractor, image_encoder, transformer
+
+    set_status_stage("Loading models")
     free_mem_gb = get_cuda_free_memory_gb(gpu)
     high_vram = free_mem_gb > 60
 
@@ -613,7 +762,42 @@ def load_models():
     feature_extractor = SiglipImageProcessor.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="feature_extractor")
     image_encoder = SiglipVisionModel.from_pretrained("lllyasviel/flux_redux_bfl", subfolder="image_encoder", torch_dtype=dtype, low_cpu_mem_usage=True).cpu()
 
-    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained("lllyasviel/FramePackI2V_HY", torch_dtype=transformer_dtype, low_cpu_mem_usage=True).cpu()
+    _quant_cache_hit = False
+    _quant_cache_file = (
+        _quant_cache_path(transformer_dtype, quant_mode)
+        if (TORCHAO_AVAILABLE and quant_mode != "none")
+        else None
+    )
+
+    transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
+        "lllyasviel/FramePackI2V_HY",
+        torch_dtype=transformer_dtype,
+        low_cpu_mem_usage=True,
+    ).cpu()
+
+    # A cached quantized state dict can replace the transformer weights without
+    # requantizing. It is memory-mapped, so the quantized tensors are paged in
+    # lazily instead of being copied into RAM up front.
+    if TORCHAO_AVAILABLE and _quant_cache_file is not None and os.path.isfile(_quant_cache_file):
+        try:
+            set_status_stage("Loading quantized cache")
+            print(f"Loading quantized transformer weights from temp cache: {_quant_cache_file}", flush=True)
+            cached_state_dict = torch.load(
+                _quant_cache_file,
+                map_location="cpu",
+                weights_only=False,
+                mmap=True,
+            )
+            transformer.load_state_dict(cached_state_dict, assign=True)
+            _quant_cache_hit = True
+            print("Quantized transformer cache loaded with mmap.", flush=True)
+            del cached_state_dict
+        except Exception as e:
+            print(f"Quantized transformer cache could not be loaded ({e}); rebuilding.", flush=True)
+            try:
+                os.remove(_quant_cache_file)
+            except OSError:
+                pass
 
     vae.eval()
     text_encoder.eval()
@@ -628,17 +812,100 @@ def load_models():
     transformer.high_quality_fp32_output_for_inference = False
     print("transformer.high_quality_fp32_output_for_inference = False")
 
-    transformer.to(dtype=transformer_dtype)
+    if not _quant_cache_hit:
+        transformer.to(dtype=transformer_dtype)
     vae.to(dtype=dtype)
     image_encoder.to(dtype=dtype)
     text_encoder.to(dtype=dtype)
     text_encoder_2.to(dtype=dtype)
 
-    # Quantize transformer to fp8 (weight-only) to reduce memory on iGPU.
-    if TORCHAO_AVAILABLE:
-        print("Quantizing transformer to int4 (weight-only) ...", flush=True)
-        _quantize_transformer_memory_efficient(transformer, _IntxCfg(weight_dtype=torch.int4))
+    # Quantize transformer to int4 (weight-only) to reduce memory on iGPU.
+    # On a cache hit the quantized transformer was already loaded from the temp
+    # folder above; otherwise quantize in memory and precompute the result to
+    # the temp folder so later runs can mmap it instead of requantizing.
+    if TORCHAO_AVAILABLE and not _quant_cache_hit and quant_mode != "none":
+        set_status_stage("Quantizing transformer")
+        print(f"Quantizing transformer to {quant_mode} (weight-only) ...", flush=True)
+
+        _partial_cache_file = (
+            _quant_cache_file + ".partial.pt" if _quant_cache_file is not None else None
+        )
+        _completed_fqns = []
+
+        # Resume from a partial quantization checkpoint if one exists.
+        if _partial_cache_file is not None and os.path.isfile(_partial_cache_file):
+            try:
+                print(f"Loading partial quantization checkpoint: {_partial_cache_file}", flush=True)
+                _partial_ckpt = torch.load(
+                    _partial_cache_file,
+                    map_location="cpu",
+                    weights_only=False,
+                    mmap=True,
+                )
+                transformer.load_state_dict(_partial_ckpt["state_dict"], assign=True)
+                _completed_fqns = list(_partial_ckpt.get("completed", []))
+                print(
+                    f"Resuming quantization from checkpoint: {len(_completed_fqns)} modules already done.",
+                    flush=True,
+                )
+                del _partial_ckpt
+            except Exception as e:
+                print(f"Partial quantization checkpoint could not be loaded ({e}); starting over.", flush=True)
+                try:
+                    os.remove(_partial_cache_file)
+                except OSError:
+                    pass
+                _completed_fqns = []
+
+        def _make_quant_cfg(mode):
+            mode = mode.lower()
+            if mode == "nf4":
+                if _NF4_WEIGHT_ONLY_CONFIG is None:
+                    raise RuntimeError("NF4WeightOnlyConfig is not available in this torchao build")
+                return _NF4_WEIGHT_ONLY_CONFIG()
+            if mode == "int4":
+                return _IntxCfg(weight_dtype=torch.int4)
+            if mode == "int3":
+                return _IntxCfg(weight_dtype=torch.int3)
+            raise ValueError(f"Unknown quantization mode: {mode}")
+
+        _quant_cfg = _make_quant_cfg(quant_mode)
+        _completed_fqns = _quantize_transformer_memory_efficient(
+            transformer,
+            _quant_cfg,
+            completed_fqns=_completed_fqns,
+            checkpoint_path=_partial_cache_file,
+        )
         print("Transformer quantization done.", flush=True)
+
+        if _quant_cache_file is not None:
+            try:
+                print(f"Saving quantized transformer to temp cache: {_quant_cache_file}", flush=True)
+                _tmp_cache = _quant_cache_file + ".tmp"
+                torch.save(transformer.state_dict(), _tmp_cache)
+                os.replace(_tmp_cache, _quant_cache_file)
+                print("Quantized transformer cache saved.", flush=True)
+
+                # The full cache now supersedes any partial checkpoint.
+                if _partial_cache_file is not None:
+                    for _path in (_partial_cache_file, _partial_cache_file + ".tmp"):
+                        try:
+                            if os.path.exists(_path):
+                                os.remove(_path)
+                        except OSError:
+                            pass
+
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception as e:
+                print(f"Warning: could not save quantized transformer cache: {e}", flush=True)
+                try:
+                    if os.path.exists(_tmp_cache):
+                        os.remove(_tmp_cache)
+                except OSError:
+                    pass
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -680,7 +947,10 @@ def run_generation(
     gpu_memory_preservation=6.0,
     use_teacache=True,
     mp4_crf=16,
+    checkpoint_path=None,
 ):
+    global vae
+    vae_force_cpu = False
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -689,6 +959,7 @@ def run_generation(
         if dynamic_swap:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
 
+        set_status_stage("Text encoding")
         # Text encoding
         print("Text encoding ...")
         if dynamic_swap:
@@ -705,6 +976,7 @@ def run_generation(
         llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
         llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
 
+        set_status_stage("Image processing")
         # Processing input image
         print("Image processing ...")
         H, W, C = input_image.shape
@@ -714,13 +986,29 @@ def run_generation(
         input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
         input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
 
+        set_status_stage("VAE encoding")
         # VAE encoding
         print("VAE encoding ...")
-        if dynamic_swap:
-            load_model_as_complete(vae, target_device=gpu)
+        try:
+            if dynamic_swap and not vae_force_cpu:
+                load_model_as_complete(vae, target_device=gpu)
+            start_latent = vae_encode(input_image_pt, vae)
+        except RuntimeError as e:
+            if "out of memory" not in str(e).lower():
+                raise
+            print("VAE encode OOM on GPU; falling back to CPU.", flush=True)
+            vae_force_cpu = True
+            try:
+                vae = vae.to("cpu")
+            except Exception:
+                pass
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            start_latent = vae_encode(input_image_pt, vae)
 
-        start_latent = vae_encode(input_image_pt, vae)
-
+        set_status_stage("CLIP Vision encoding")
         # CLIP Vision
         print("CLIP Vision encoding ...")
         if dynamic_swap:
@@ -736,24 +1024,58 @@ def run_generation(
         clip_l_pooler_n = clip_l_pooler_n.to(transformer.dtype)
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
+        set_status_stage("Sampling")
         # Sampling
         print("Start sampling ...")
         rnd = torch.Generator("cpu").manual_seed(seed)
         num_frames = latent_window_size * 4 - 3
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
-        history_pixels = None
-        total_generated_latent_frames = 0
-
-        latent_paddings = reversed(range(total_latent_sections))
-
+        latent_paddings = list(reversed(range(total_latent_sections)))
         if total_latent_sections > 4:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-        for latent_padding in latent_paddings:
+        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        history_pixels = None
+        total_generated_latent_frames = 0
+        _completed_sections = 0
+
+        # Resume from a generation checkpoint if one exists.
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            try:
+                _gen_ckpt = torch.load(
+                    checkpoint_path,
+                    map_location="cpu",
+                    weights_only=False,
+                    mmap=True,
+                )
+                if _gen_ckpt.get("latent_paddings") == latent_paddings:
+                    _completed_sections = int(_gen_ckpt.get("completed", 0))
+                    history_latents = _gen_ckpt["history_latents"]
+                    history_pixels = _gen_ckpt["history_pixels"]
+                    total_generated_latent_frames = int(_gen_ckpt.get("total_generated_latent_frames", 0))
+                    if _gen_ckpt.get("rng_state") is not None:
+                        rnd.set_state(_gen_ckpt["rng_state"])
+                    print(
+                        f"Resuming generation from checkpoint: {_completed_sections}/{len(latent_paddings)} sections done.",
+                        flush=True,
+                    )
+                else:
+                    print("Generation checkpoint does not match this run; starting over.", flush=True)
+                del _gen_ckpt
+            except Exception as e:
+                print(f"Generation checkpoint could not be loaded ({e}); starting over.", flush=True)
+                try:
+                    os.remove(checkpoint_path)
+                except OSError:
+                    pass
+
+        for section_index, latent_padding in enumerate(latent_paddings):
+            if section_index < _completed_sections:
+                continue
             is_last_section = latent_padding == 0
             latent_padding_size = latent_padding * latent_window_size
 
+            set_status_stage(f"Sampling section {section_index + 1}/{len(latent_paddings)}")
             print(f"latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}")
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
@@ -818,28 +1140,98 @@ def run_generation(
 
             if dynamic_swap:
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                load_model_as_complete(vae, target_device=gpu)
+                if not vae_force_cpu:
+                    load_model_as_complete(vae, target_device=gpu)
 
+            set_status_stage(f"VAE decoding section {section_index + 1}/{len(latent_paddings)}")
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
-                history_pixels = vae_decode(real_history_latents, vae).cpu()
+                try:
+                    history_pixels = vae_decode(real_history_latents, vae).cpu()
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
+                    vae_force_cpu = True
+                    try:
+                        vae = vae.to("cpu")
+                    except Exception:
+                        pass
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    history_pixels = vae_decode(real_history_latents, vae).cpu()
             else:
                 section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
                 overlapped_frames = latent_window_size * 4 - 3
 
-                current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                try:
+                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                except RuntimeError as e:
+                    if "out of memory" not in str(e).lower():
+                        raise
+                    print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
+                    vae_force_cpu = True
+                    try:
+                        vae = vae.to("cpu")
+                    except Exception:
+                        pass
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                 history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
 
             if dynamic_swap:
                 unload_complete_models()
 
+            set_status_stage("Saving video")
             os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
             _save_bcthw_as_mp4(history_pixels, output_path, fps=30, crf=mp4_crf)
             print(f"Saved {output_path} (latent frames: {total_generated_latent_frames})")
 
+            # Persist a resumable checkpoint after each completed section.
+            if checkpoint_path:
+                try:
+                    _tmp_gen_ckpt = checkpoint_path + ".tmp"
+                    torch.save(
+                        {
+                            "completed": section_index + 1,
+                            "latent_paddings": latent_paddings,
+                            "history_latents": history_latents,
+                            "history_pixels": history_pixels,
+                            "total_generated_latent_frames": total_generated_latent_frames,
+                            "rng_state": rnd.get_state(),
+                        },
+                        _tmp_gen_ckpt,
+                    )
+                    os.replace(_tmp_gen_ckpt, checkpoint_path)
+                    print(
+                        f"Generation checkpoint saved: {section_index + 1}/{len(latent_paddings)} sections.",
+                        flush=True,
+                    )
+                except Exception as e:
+                    print(f"Warning: could not save generation checkpoint: {e}", flush=True)
+                    try:
+                        if os.path.exists(_tmp_gen_ckpt):
+                            os.remove(_tmp_gen_ckpt)
+                    except OSError:
+                        pass
+
             if is_last_section:
                 break
+
+        # Generation completed successfully; remove any resumable checkpoint.
+        if checkpoint_path:
+            for _p in (checkpoint_path, checkpoint_path + ".tmp"):
+                try:
+                    if os.path.exists(_p):
+                        os.remove(_p)
+                except OSError:
+                    pass
     except Exception:
         traceback.print_exc()
         if dynamic_swap:
@@ -881,6 +1273,11 @@ def main():
     parser.add_argument("--teacache", action="store_true", default=True, help="Use TeaCache.")
     parser.add_argument("--no-teacache", dest="teacache", action="store_false", help="Disable TeaCache.")
     parser.add_argument("--crf", type=int, default=16, help="MP4 CRF (lower = better quality).")
+    parser.add_argument(
+        "--quantization", "--quant", dest="quantization", default="nf4",
+        choices=["nf4", "int4", "int3", "none"],
+        help="Transformer weight quantization mode. Default: nf4.",
+    )
     args = parser.parse_args()
 
     # Accept the image either as a positional argument (in either order relative
@@ -929,7 +1326,7 @@ def main():
 
     input_image = np.array(Image.open(input_path).convert("RGB"))
 
-    load_models()
+    load_models(args.quantization)
 
     if args.output:
         output_path = args.output
@@ -942,25 +1339,52 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     print(f"Output: {output_path}")
+
+    # Resumable generation checkpoint on disk.
+    _gen_checkpoint_dir = os.path.join(tempfile.gettempdir(), "opencode", "framepack-gen-checkpoints")
+    os.makedirs(_gen_checkpoint_dir, exist_ok=True)
+    _gen_checkpoint_key = hashlib.sha256(
+        f"{output_path}|{prompt}|{args.seed}|{args.seconds}|{args.steps}|{args.latent_window_size}".encode("utf-8")
+    ).hexdigest()[:16]
+    checkpoint_path = os.path.join(_gen_checkpoint_dir, f"generation-{_gen_checkpoint_key}.ckpt.pt")
+    print(f"Generation checkpoint: {checkpoint_path}", flush=True)
+
     with _memory_efficient_attention_on_older_gpus():
-        run_generation(
-            input_image=input_image,
-            prompt=prompt,
-            output_path=output_path,
-            n_prompt=args.negative,
-            seed=args.seed,
-            total_second_length=args.seconds,
-            latent_window_size=args.latent_window_size,
-            steps=args.steps,
-            cfg=args.cfg,
-            gs=args.gs,
-            rs=args.rs,
-            gpu_memory_preservation=args.gpu_memory_preservation,
-            use_teacache=args.teacache,
-            mp4_crf=args.crf,
-        )
+        for _attempt in range(3):
+            try:
+                run_generation(
+                    input_image=input_image,
+                    prompt=prompt,
+                    output_path=output_path,
+                    n_prompt=args.negative,
+                    seed=args.seed,
+                    total_second_length=args.seconds,
+                    latent_window_size=args.latent_window_size,
+                    steps=args.steps,
+                    cfg=args.cfg,
+                    gs=args.gs,
+                    rs=args.rs,
+                    gpu_memory_preservation=args.gpu_memory_preservation,
+                    use_teacache=args.teacache,
+                    mp4_crf=args.crf,
+                    checkpoint_path=checkpoint_path,
+                )
+                break
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower() and _attempt < 2:
+                    print("Out of memory during generation; cleaning up and resuming from checkpoint.", flush=True)
+                    import gc
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    continue
+                raise
     print(f"Done: {output_path}")
 
 
 if __name__ == "__main__":
-    main()
+    start_status_bar()
+    try:
+        main()
+    finally:
+        stop_status_bar()
