@@ -42,10 +42,15 @@ from its original NVIDIA/CUDA setup to AMD/ROCm.
 - Quantization is checkpointed every 50 of 549 linear modules to
   `transformer-int4-*.partial.pt`; a crashed/interrupted run resumes from the
   last completed module instead of starting over.
+- Quantized weights and checkpoints are now stored under the invocation folder
+  instead of `/tmp`, so they survive reboots.
 - Generation is checkpointed after each completed latent section to
   `/tmp/opencode/framepack-gen-checkpoints/generation-*.ckpt.pt`; an OOM or crash
   resumes from the last completed section. Main loop retries up to 3 times on
   CUDA/ROCm OOM after clearing cache.
+- Generation now also writes a checkpoint after each stage (text encoding, image
+  processing, VAE encoding, CLIP Vision, and each sampling/VAE-decode section),
+  allowing resume from the last completed stage.
 - On the Radeon 780M test, quantization completed in roughly 15-20 minutes and
   produced a 13 GB cache file. The first 8-step sampling section took about
   36 minutes. VAE decode after sampling is also very slow and may appear stalled.
@@ -56,6 +61,9 @@ from its original NVIDIA/CUDA setup to AMD/ROCm.
   still works.
 - Process state can sit in uninterruptible disk wait (`D`) while paging the
   13 GB cache; avoid starting a second instance during this time.
+- Execution logs are now written to `framepack-execution.log` in the invocation
+  folder (not `/tmp`), with CPU/GPU memory allocation at each stage. Repeated
+  `GPU_CRASH` entries force VAE encode/decode to CPU on the next run.
 - The script now has a stderr status bar showing CPU/RAM and GPU VRAM usage plus
   the current stage (`set_status_stage`). GPU utilization is not available without
   `amdsmi`; VRAM allocated/reserved is shown instead.
@@ -111,8 +119,8 @@ Observed resource usage during the 2-second test:
 - GPU VRAM: about 7.5-12.4 GB allocated, 11.7-12.8 GB reserved, 21.8 GB total.
 - First 8-step sampling section: about 30 minutes.
 - VAE decode after section 1: still running/long; treat it as a major cost.
-- VAE encode/decode now try GPU first and fall back to CPU on OOM, then stay on CPU
-  for the rest of the run.
+- VAE encoding tries GPU first and falls back to CPU on OOM.
+- VAE decoding now defaults to CPU for stability.
 
 ## Why sampling is slow
 
@@ -122,4 +130,20 @@ Observed resource usage during the 2-second test:
 - Quantized int4/NF4 weights reduce memory but add dequantization overhead to matmuls.
 - RAM is nearly full (~15/15.6 GB), causing swap/paging and frequent GC/cache cleanup.
 - Default sampling is 25 steps per latent section; even 8 steps took about 30 minutes in testing.
+
+## WSL2 vs native Linux
+
+- Native Linux would likely be somewhat faster and more stable due to direct `amdgpu`
+  driver access, less WSL2/DXG overhead, and easier installation of ROCm-optimized
+  attention libraries.
+- PyTorch reports a native SDPA flash backend as enabled, but XFormers, Flash Attn,
+  and Sage Attn are not installed in this environment.
+- WSL2 is sufficient for basic functional correctness testing of the script and
+  workflow, including argument parsing, model loading, quantization, checkpointing,
+  resume, and generation code paths.
+- WSL2 is not ideal for hardware validation: the 780M over WSL2/DXG is prone to
+  kernel resets and memory pressure, and utilities such as `rocm-smi`/`amdsmi`
+  may not work.
+- Performance and memory behavior are not representative of a native Linux dGPU
+  setup.
 PY

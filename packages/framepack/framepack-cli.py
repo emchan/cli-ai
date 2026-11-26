@@ -29,6 +29,7 @@ import tempfile
 import hashlib
 import threading
 import time
+import time
 
 # Script/output root.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -663,9 +664,54 @@ def _quant_cache_path(transformer_dtype, quant_mode="int4"):
 
 QUANT_CACHE_DIR = os.environ.get(
     "FRAMEPACK_QUANT_CACHE",
-    os.path.join(tempfile.gettempdir(), "opencode", "framepack-quant-cache"),
+    os.path.join(INVOCATION_DIR, "framepack-quant-cache"),
 )
 os.makedirs(QUANT_CACHE_DIR, exist_ok=True)
+
+
+EXECUTION_LOG = os.environ.get(
+    "FRAMEPACK_EXECUTION_LOG",
+    os.path.join(INVOCATION_DIR, "framepack-execution.log"),
+)
+FORCE_VAE_CPU = False
+
+
+def memory_summary():
+    parts = []
+    try:
+        import psutil
+        vm = psutil.virtual_memory()
+        parts.append(f"RAM {vm.used / (1024 ** 3):.1f}/{vm.total / (1024 ** 3):.1f}GB")
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            parts.append(
+                f"GPU {torch.cuda.memory_allocated() / (1024 ** 3):.1f}/"
+                f"{torch.cuda.get_device_properties(0).total_memory / (1024 ** 3):.1f}GB"
+            )
+    except Exception:
+        pass
+    return " | ".join(parts)
+
+
+def log_execution(message):
+    try:
+        os.makedirs(os.path.dirname(EXECUTION_LOG), exist_ok=True)
+        with open(EXECUTION_LOG, "a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.datetime.now().isoformat()} {message} [{memory_summary()}]\n")
+    except Exception:
+        pass
+
+
+def repeated_gpu_crashes(threshold=2):
+    try:
+        with open(EXECUTION_LOG, encoding="utf-8") as handle:
+            lines = handle.readlines()[-100:]
+        return sum("GPU_CRASH" in line for line in lines) >= threshold
+    except Exception:
+        return False
 
 
 _STATUS_STAGE = "idle"
@@ -676,6 +722,49 @@ _STATUS_THREAD = None
 def set_status_stage(stage):
     global _STATUS_STAGE
     _STATUS_STAGE = str(stage)
+
+
+def _query_gpu_utilization():
+    """Best-effort iGPU utilization via Windows performance counters from WSL."""
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-Command",
+                "(Get-Counter '\\GPU Engine(*)\\Utilization Percentage' -ErrorAction SilentlyContinue).CounterSamples | "
+                "Measure-Object -Property CookedValue -Sum | Select-Object -ExpandProperty Sum",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        value = result.stdout.strip()
+        if value:
+            return float(value)
+    except Exception:
+        pass
+    return None
+
+
+def _query_gpu_total_vram_gb():
+    """Best-effort dedicated GPU VRAM via Windows (not shared system memory)."""
+    try:
+        result = subprocess.run(
+            [
+                "powershell.exe", "-NoProfile", "-Command",
+                "(Get-CimInstance Win32_VideoController | Select-Object -First 1 -ExpandProperty AdapterRAM)",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+        )
+        value = result.stdout.strip()
+        if value:
+            return float(value) / (1024 ** 3)
+    except Exception:
+        pass
+    return None
 
 
 def _status_bar_loop(interval=5):
@@ -694,14 +783,20 @@ def _status_bar_loop(interval=5):
                 import torch
                 if torch.cuda.is_available():
                     alloc = torch.cuda.memory_allocated() / (1024 ** 3)
-                    reserved = torch.cuda.memory_reserved() / (1024 ** 3)
-                    total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-                    gpu_str = f"{alloc:.1f}/{total:.1f}GB (reserved {reserved:.1f}GB)"
+                    total = _query_gpu_total_vram_gb()
+                    if total is None:
+                        total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+                    gpu_str = f"{alloc:.1f}/{total:.1f}GB"
             except Exception:
                 pass
+            gpu_util = _query_gpu_utilization()
+            if gpu_util is not None:
+                gpu_str = f"util {gpu_util:.0f}% | VRAM {gpu_str}"
+            else:
+                gpu_str = f"VRAM {gpu_str}"
             line = (
-                f"\\r[STATUS] stage={_STATUS_STAGE} | CPU {cpu:5.1f}% | "
-                f"RAM {mem_used_gb:.1f}/{mem_total_gb:.1f}GB | GPU VRAM {gpu_str}   "
+                f"\r[STATUS] stage={_STATUS_STAGE} | CPU {cpu:5.1f}% | "
+                f"RAM {mem_used_gb:.1f}/{mem_total_gb:.1f}GB | GPU {gpu_str}   "
             )
             sys.stderr.write(line)
             sys.stderr.flush()
@@ -709,7 +804,7 @@ def _status_bar_loop(interval=5):
             pass
         _STATUS_STOP.wait(interval)
     try:
-        sys.stderr.write("\\n")
+        sys.stderr.write("\n")
         sys.stderr.flush()
     except Exception:
         pass
@@ -745,6 +840,7 @@ def load_models(quant_mode=None):
     global feature_extractor, image_encoder, transformer
 
     set_status_stage("Loading models")
+    log_execution("STAGE: Loading models")
     free_mem_gb = get_cuda_free_memory_gb(gpu)
     high_vram = free_mem_gb > 60
 
@@ -769,6 +865,17 @@ def load_models(quant_mode=None):
         else None
     )
 
+    # Recover caches interrupted while being written.
+    if _quant_cache_file is not None:
+        for _cache_path in (_quant_cache_file, _quant_cache_file + ".partial.pt"):
+            _cache_tmp = _cache_path + ".tmp"
+            if not os.path.isfile(_cache_path) and os.path.isfile(_cache_tmp):
+                try:
+                    os.replace(_cache_tmp, _cache_path)
+                    print(f"Recovered interrupted cache file: {_cache_path}", flush=True)
+                except Exception as e:
+                    print(f"Could not recover {_cache_tmp}: {e}", flush=True)
+
     transformer = HunyuanVideoTransformer3DModelPacked.from_pretrained(
         "lllyasviel/FramePackI2V_HY",
         torch_dtype=transformer_dtype,
@@ -781,6 +888,7 @@ def load_models(quant_mode=None):
     if TORCHAO_AVAILABLE and _quant_cache_file is not None and os.path.isfile(_quant_cache_file):
         try:
             set_status_stage("Loading quantized cache")
+            log_execution("STAGE: Loading quantized cache")
             print(f"Loading quantized transformer weights from temp cache: {_quant_cache_file}", flush=True)
             cached_state_dict = torch.load(
                 _quant_cache_file,
@@ -825,6 +933,7 @@ def load_models(quant_mode=None):
     # the temp folder so later runs can mmap it instead of requantizing.
     if TORCHAO_AVAILABLE and not _quant_cache_hit and quant_mode != "none":
         set_status_stage("Quantizing transformer")
+        log_execution("STAGE: Quantizing transformer")
         print(f"Quantizing transformer to {quant_mode} (weight-only) ...", flush=True)
 
         _partial_cache_file = (
@@ -950,7 +1059,10 @@ def run_generation(
     checkpoint_path=None,
 ):
     global vae
-    vae_force_cpu = False
+    vae_force_cpu = FORCE_VAE_CPU
+    vae_decode_on_cpu = True
+    if vae_force_cpu:
+        print("Repeated GPU crashes detected in execution log; forcing VAE to CPU.", flush=True)
     total_latent_sections = (total_second_length * 30) / (latent_window_size * 4)
     total_latent_sections = int(max(round(total_latent_sections), 1))
 
@@ -959,63 +1071,181 @@ def run_generation(
         if dynamic_swap:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
 
+        rnd = torch.Generator("cpu").manual_seed(seed)
+        num_frames = latent_window_size * 4 - 3
+        latent_paddings = list(reversed(range(total_latent_sections)))
+        if total_latent_sections > 4:
+            latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
+
+        _ckpt_state = {}
+        _completed_sections = 0
+        if checkpoint_path and os.path.isfile(checkpoint_path):
+            try:
+                _loaded_ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False, mmap=True)
+                _ckpt_state.update(_loaded_ckpt)
+                if _ckpt_state.get("latent_paddings") not in (None, latent_paddings):
+                    print("Generation checkpoint does not match this run; starting over.", flush=True)
+                    try:
+                        os.remove(checkpoint_path)
+                    except OSError:
+                        pass
+                    _ckpt_state = {}
+                else:
+                    _completed_sections = int(_ckpt_state.get("completed", 0))
+                    if _ckpt_state.get("rng_state") is not None:
+                        rnd.set_state(_ckpt_state["rng_state"])
+                    print(f"Resuming generation from checkpoint: stage={_ckpt_state.get('stage')}, {_completed_sections}/{len(latent_paddings)} sections.", flush=True)
+            except Exception as e:
+                print(f"Generation checkpoint could not be loaded ({e}); starting over.", flush=True)
+                try:
+                    os.remove(checkpoint_path)
+                except OSError:
+                    pass
+                _ckpt_state = {}
+            finally:
+                try:
+                    del _loaded_ckpt
+                except Exception:
+                    pass
+
+        def _save_generation_checkpoint(stage):
+            _ckpt_state["stage"] = stage
+            _ckpt_state["latent_paddings"] = latent_paddings
+            _ckpt_state["completed"] = _completed_sections
+            try:
+                _ckpt_state["history_latents"] = history_latents
+            except NameError:
+                pass
+            try:
+                _ckpt_state["history_pixels"] = history_pixels
+            except NameError:
+                pass
+            try:
+                _ckpt_state["total_generated_latent_frames"] = total_generated_latent_frames
+            except NameError:
+                pass
+            _ckpt_state["rng_state"] = rnd.get_state()
+            if checkpoint_path:
+                try:
+                    _tmp_gen_ckpt = checkpoint_path + ".tmp"
+                    torch.save(dict(_ckpt_state), _tmp_gen_ckpt)
+                    os.replace(_tmp_gen_ckpt, checkpoint_path)
+                    print(f"Generation checkpoint saved: stage={stage}.", flush=True)
+                except Exception as e:
+                    print(f"Warning: could not save generation checkpoint: {e}", flush=True)
+                    try:
+                        if os.path.exists(_tmp_gen_ckpt):
+                            os.remove(_tmp_gen_ckpt)
+                    except OSError:
+                        pass
+
         set_status_stage("Text encoding")
+        log_execution("STAGE: Text encoding")
         # Text encoding
         print("Text encoding ...")
         if dynamic_swap:
             fake_diffusers_current_device(text_encoder, gpu)
             load_model_as_complete(text_encoder_2, target_device=gpu)
 
-        llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
-
-        if cfg == 1:
-            llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+        if "llama_vec" in _ckpt_state:
+            llama_vec = _ckpt_state["llama_vec"]
+            clip_l_pooler = _ckpt_state["clip_l_pooler"]
+            llama_vec_n = _ckpt_state["llama_vec_n"]
+            clip_l_pooler_n = _ckpt_state["clip_l_pooler_n"]
+            llama_attention_mask = _ckpt_state["llama_attention_mask"]
+            llama_vec_n = _ckpt_state.get("llama_vec_n", llama_vec_n)
+            llama_attention_mask_n = _ckpt_state["llama_attention_mask_n"]
+            print("Resuming: text encoding restored from checkpoint.", flush=True)
         else:
-            llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+            llama_vec, clip_l_pooler = encode_prompt_conds(prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
 
-        llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
-        llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+            if cfg == 1:
+                llama_vec_n, clip_l_pooler_n = torch.zeros_like(llama_vec), torch.zeros_like(clip_l_pooler)
+            else:
+                llama_vec_n, clip_l_pooler_n = encode_prompt_conds(n_prompt, text_encoder, text_encoder_2, tokenizer, tokenizer_2)
+
+            llama_vec, llama_attention_mask = crop_or_pad_yield_mask(llama_vec, length=512)
+            llama_vec_n, llama_attention_mask_n = crop_or_pad_yield_mask(llama_vec_n, length=512)
+            _ckpt_state.update({
+                "llama_vec": llama_vec,
+                "clip_l_pooler": clip_l_pooler,
+                "llama_vec_n": llama_vec_n,
+                "clip_l_pooler_n": clip_l_pooler_n,
+                "llama_attention_mask": llama_attention_mask,
+                "llama_attention_mask_n": llama_attention_mask_n,
+            })
+            _save_generation_checkpoint("text_encoding")
 
         set_status_stage("Image processing")
+        log_execution("STAGE: Image processing")
         # Processing input image
         print("Image processing ...")
-        H, W, C = input_image.shape
-        height, width = find_nearest_bucket(H, W, resolution=640)
-        input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
+        if "height" in _ckpt_state:
+            height = _ckpt_state["height"]
+            width = _ckpt_state["width"]
+            input_image_np = _ckpt_state["input_image_np"]
+            input_image_pt = _ckpt_state["input_image_pt"]
+            print("Resuming: image processing restored from checkpoint.", flush=True)
+        else:
+            H, W, C = input_image.shape
+            height, width = find_nearest_bucket(H, W, resolution=640)
+            input_image_np = resize_and_center_crop(input_image, target_width=width, target_height=height)
 
-        input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
-        input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+            input_image_pt = torch.from_numpy(input_image_np).float() / 127.5 - 1
+            input_image_pt = input_image_pt.permute(2, 0, 1)[None, :, None]
+            _ckpt_state.update({
+                "height": height,
+                "width": width,
+                "input_image_np": input_image_np,
+                "input_image_pt": input_image_pt,
+            })
+            _save_generation_checkpoint("image_processing")
 
         set_status_stage("VAE encoding")
+        log_execution("STAGE: VAE encoding")
         # VAE encoding
         print("VAE encoding ...")
-        try:
-            if dynamic_swap and not vae_force_cpu:
-                load_model_as_complete(vae, target_device=gpu)
-            start_latent = vae_encode(input_image_pt, vae)
-        except RuntimeError as e:
-            if "out of memory" not in str(e).lower():
-                raise
-            print("VAE encode OOM on GPU; falling back to CPU.", flush=True)
-            vae_force_cpu = True
+        if "start_latent" in _ckpt_state:
+            start_latent = _ckpt_state["start_latent"]
+            print("Resuming: VAE encoding restored from checkpoint.", flush=True)
+        else:
             try:
-                vae = vae.to("cpu")
-            except Exception:
-                pass
-            import gc
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            start_latent = vae_encode(input_image_pt, vae)
+                if dynamic_swap and not vae_force_cpu:
+                    load_model_as_complete(vae, target_device=gpu)
+                start_latent = vae_encode(input_image_pt, vae)
+            except RuntimeError as e:
+                if "out of memory" not in str(e).lower():
+                    raise
+                print("VAE encode OOM on GPU; falling back to CPU.", flush=True)
+                log_execution("GPU_CRASH: VAE encode OOM; falling back to CPU")
+                vae_force_cpu = True
+                try:
+                    vae = vae.to("cpu")
+                except Exception:
+                    pass
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                start_latent = vae_encode(input_image_pt, vae)
+            _ckpt_state["start_latent"] = start_latent
+            _save_generation_checkpoint("vae_encoding")
 
         set_status_stage("CLIP Vision encoding")
+        log_execution("STAGE: CLIP Vision encoding")
         # CLIP Vision
         print("CLIP Vision encoding ...")
         if dynamic_swap:
             load_model_as_complete(image_encoder, target_device=gpu)
 
-        image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
-        image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+        if "image_encoder_last_hidden_state" in _ckpt_state:
+            image_encoder_last_hidden_state = _ckpt_state["image_encoder_last_hidden_state"]
+            print("Resuming: CLIP Vision restored from checkpoint.", flush=True)
+        else:
+            image_encoder_output = hf_clip_vision_encode(input_image_np, feature_extractor, image_encoder)
+            image_encoder_last_hidden_state = image_encoder_output.last_hidden_state
+            _ckpt_state["image_encoder_last_hidden_state"] = image_encoder_last_hidden_state
+            _save_generation_checkpoint("clip_vision")
 
         # Dtype
         llama_vec = llama_vec.to(transformer.dtype)
@@ -1025,6 +1255,7 @@ def run_generation(
         image_encoder_last_hidden_state = image_encoder_last_hidden_state.to(transformer.dtype)
 
         set_status_stage("Sampling")
+        log_execution("STAGE: Sampling")
         # Sampling
         print("Start sampling ...")
         rnd = torch.Generator("cpu").manual_seed(seed)
@@ -1076,6 +1307,7 @@ def run_generation(
             latent_padding_size = latent_padding * latent_window_size
 
             set_status_stage(f"Sampling section {section_index + 1}/{len(latent_paddings)}")
+            log_execution(f"STAGE: Sampling section {section_index + 1}/{len(latent_paddings)}")
             print(f"latent_padding_size = {latent_padding_size}, is_last_section = {is_last_section}")
 
             indices = torch.arange(0, sum([1, latent_padding_size, latent_window_size, 1, 2, 16])).unsqueeze(0)
@@ -1140,10 +1372,20 @@ def run_generation(
 
             if dynamic_swap:
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
-                if not vae_force_cpu:
+                if not vae_force_cpu and not vae_decode_on_cpu:
                     load_model_as_complete(vae, target_device=gpu)
 
             set_status_stage(f"VAE decoding section {section_index + 1}/{len(latent_paddings)}")
+            log_execution(f"STAGE: VAE decoding section {section_index + 1}/{len(latent_paddings)}")
+            if vae_decode_on_cpu:
+                try:
+                    vae = vae.to("cpu")
+                except Exception:
+                    pass
+                import gc
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
             if history_pixels is None:
@@ -1153,6 +1395,7 @@ def run_generation(
                     if "out of memory" not in str(e).lower():
                         raise
                     print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
+                    log_execution("GPU_CRASH: VAE decode OOM; falling back to CPU")
                     vae_force_cpu = True
                     try:
                         vae = vae.to("cpu")
@@ -1173,6 +1416,7 @@ def run_generation(
                     if "out of memory" not in str(e).lower():
                         raise
                     print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
+                    log_execution("GPU_CRASH: VAE decode OOM; falling back to CPU")
                     vae_force_cpu = True
                     try:
                         vae = vae.to("cpu")
@@ -1194,6 +1438,7 @@ def run_generation(
             print(f"Saved {output_path} (latent frames: {total_generated_latent_frames})")
 
             # Persist a resumable checkpoint after each completed section.
+            _completed_sections = section_index + 1
             if checkpoint_path:
                 try:
                     _tmp_gen_ckpt = checkpoint_path + ".tmp"
@@ -1232,8 +1477,13 @@ def run_generation(
                         os.remove(_p)
                 except OSError:
                     pass
-    except Exception:
+    except Exception as e:
         traceback.print_exc()
+        message = str(e)
+        if "out of memory" in message.lower() or "hip" in message.lower():
+            log_execution(f"GPU_CRASH: {type(e).__name__}: {message[:300]}")
+        else:
+            log_execution(f"ERROR: {type(e).__name__}: {message[:300]}")
         if dynamic_swap:
             unload_complete_models(text_encoder, text_encoder_2, image_encoder, vae, transformer)
         raise
@@ -1326,6 +1576,12 @@ def main():
 
     input_image = np.array(Image.open(input_path).convert("RGB"))
 
+    global FORCE_VAE_CPU
+    FORCE_VAE_CPU = repeated_gpu_crashes()
+    if FORCE_VAE_CPU:
+        print("Repeated GPU crashes detected in execution log; forcing VAE to CPU.", flush=True)
+    log_execution(f"START pid={os.getpid()} args={' '.join(sys.argv[1:])}")
+
     load_models(args.quantization)
 
     if args.output:
@@ -1341,7 +1597,7 @@ def main():
     print(f"Output: {output_path}")
 
     # Resumable generation checkpoint on disk.
-    _gen_checkpoint_dir = os.path.join(tempfile.gettempdir(), "opencode", "framepack-gen-checkpoints")
+    _gen_checkpoint_dir = os.path.join(INVOCATION_DIR, "framepack-gen-checkpoints")
     os.makedirs(_gen_checkpoint_dir, exist_ok=True)
     _gen_checkpoint_key = hashlib.sha256(
         f"{output_path}|{prompt}|{args.seed}|{args.seconds}|{args.steps}|{args.latent_window_size}".encode("utf-8")
@@ -1379,6 +1635,7 @@ def main():
                         torch.cuda.empty_cache()
                     continue
                 raise
+    log_execution("END success")
     print(f"Done: {output_path}")
 
 
@@ -1386,5 +1643,8 @@ if __name__ == "__main__":
     start_status_bar()
     try:
         main()
+    except Exception as e:
+        log_execution(f"END error: {type(e).__name__}: {e}")
+        raise
     finally:
         stop_status_bar()
