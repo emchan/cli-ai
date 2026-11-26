@@ -121,6 +121,28 @@ Observed resource usage during the 2-second test:
 - VAE decode after section 1: still running/long; treat it as a major cost.
 - VAE encoding tries GPU first and falls back to CPU on OOM.
 - VAE decoding now defaults to CPU for stability.
+- CPU VAE decoding is much slower than GPU decoding because the VAE decoder is a
+  large convolutional network, CPU memory bandwidth is lower, and the system is
+  already memory-bound and paging.
+
+## Optimizing `aten::cat`
+
+- Profiled sampling hotspots include `aten::cat`, `LinearNF4`, and `aten::stack`.
+- Reduce repeated history concatenation by preallocating `history_latents` and using
+  slice assignment, or reduce the number of latent sections via a larger
+  `--latent-window-size`.
+- Some `cat` calls come from FramePack internals and would require upstream changes.
+- `torch.compile` may help but is risky on this ROCm iGPU.
+
+## Profile hot spots (sampling traces)
+
+- Across saved sampling traces, the largest costs were `aten::cat` (~282 s total),
+  `LinearNF4` (~204 s total), and `aten::stack` (~201 s total).
+- This points to tensor concatenation/stacking and NF4 dequantization as major
+  overheads, not just raw matmul throughput.
+- Per-step traces also showed `aten::item` / `_local_scalar_dense` and copies as
+  significant contributors, likely from synchronization and data movement.
+- VAE/convolution costs were comparatively smaller in the sampling traces.
 
 ## Why sampling is slow
 
@@ -130,6 +152,16 @@ Observed resource usage during the 2-second test:
 - Quantized int4/NF4 weights reduce memory but add dequantization overhead to matmuls.
 - RAM is nearly full (~15/15.6 GB), causing swap/paging and frequent GC/cache cleanup.
 - Default sampling is 25 steps per latent section; even 8 steps took about 30 minutes in testing.
+
+## SDPA backend selection
+
+- The script now benchmarks PyTorch SDPA backends (`FLASH_ATTENTION`,
+  `EFFICIENT_ATTENTION`, and `MATH`) before generation and automatically uses
+  the fastest successful one.
+- On the Radeon 780M test, `EFFICIENT_ATTENTION` was dramatically faster than
+  flash attention, while flash attention was still much faster than pure math.
+- This shows that having the flash backend enabled does not necessarily mean it
+  is the best-performing path on this iGPU.
 
 ## WSL2 vs native Linux
 

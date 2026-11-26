@@ -816,6 +816,7 @@ def _status_bar_loop(interval=5):
         import psutil
     except Exception:
         return
+    _last_status_log = time.time()
     while not _STATUS_STOP.is_set():
         try:
             cpu = psutil.cpu_percent(interval=None)
@@ -845,6 +846,9 @@ def _status_bar_loop(interval=5):
             )
             sys.stderr.write(line)
             sys.stderr.flush()
+            if time.time() - _last_status_log >= 30:
+                log_execution(f"STATUS: stage={_STATUS_STAGE}")
+                _last_status_log = time.time()
         except Exception:
             pass
         _STATUS_STOP.wait(interval)
@@ -1310,7 +1314,13 @@ def run_generation(
         if total_latent_sections > 4:
             latent_paddings = [3] + [2] * (total_latent_sections - 3) + [1, 0]
 
-        history_latents = torch.zeros(size=(1, 16, 1 + 2 + 16, height // 8, width // 8), dtype=torch.float32).cpu()
+        _history_capacity = total_latent_sections * latent_window_size + (1 + 2 + 16) + 8
+        _history_buffer = torch.zeros(
+            size=(1, 16, _history_capacity, height // 8, width // 8),
+            dtype=torch.float32,
+        ).cpu()
+        _history_len = 1 + 2 + 16
+        history_latents = _history_buffer[:, :, :_history_len]
         history_pixels = None
         total_generated_latent_frames = 0
         _completed_sections = 0
@@ -1326,7 +1336,16 @@ def run_generation(
                 )
                 if _gen_ckpt.get("latent_paddings") == latent_paddings:
                     _completed_sections = int(_gen_ckpt.get("completed", 0))
-                    history_latents = _gen_ckpt["history_latents"]
+                    _loaded_history = _gen_ckpt["history_latents"]
+                    _history_len = int(_loaded_history.shape[2])
+                    if _history_len > _history_buffer.shape[2]:
+                        _extra = torch.zeros(
+                            size=(1, 16, _history_len - _history_buffer.shape[2], height // 8, width // 8),
+                            dtype=torch.float32,
+                        ).cpu()
+                        _history_buffer = torch.cat([_history_buffer, _extra], dim=2)
+                    _history_buffer[:, :, :_history_len].copy_(_loaded_history)
+                    history_latents = _history_buffer[:, :, :_history_len]
                     history_pixels = _gen_ckpt["history_pixels"]
                     total_generated_latent_frames = int(_gen_ckpt.get("total_generated_latent_frames", 0))
                     if _gen_ckpt.get("rng_state") is not None:
@@ -1381,8 +1400,31 @@ def run_generation(
             _samp_activities = [torch.profiler.ProfilerActivity.CPU]
             if torch.cuda.is_available():
                 _samp_activities.append(torch.profiler.ProfilerActivity.CUDA)
-            with torch.profiler.profile(activities=_samp_activities, record_shapes=True) as _samp_prof:
-                generated_latents = sample_hunyuan(
+            _samp_trace_counter = 0
+
+            def _samp_trace_ready(prof):
+                nonlocal _samp_trace_counter
+                _samp_trace_counter += 1
+                _path = os.path.join(INVOCATION_DIR, f"sampling_step{_samp_trace_counter}_profile_{int(time.time() * 1000)}.json")
+                prof.export_chrome_trace(_path)
+                print(f"Sampling profile flushed: {_path}", flush=True)
+
+            _samp_prof = torch.profiler.profile(
+                activities=_samp_activities,
+                schedule=torch.profiler.schedule(wait=0, warmup=0, active=1, repeat=steps + 1),
+                on_trace_ready=_samp_trace_ready,
+                record_shapes=True,
+            )
+            _samp_prof.start()
+
+            def callback(d):
+                current_step = d["i"] + 1
+                percentage = int(100.0 * current_step / steps)
+                print(f"\rSampling {current_step}/{steps} ({percentage}%)", end="", flush=True)
+                _samp_prof.step()
+                return
+
+            generated_latents = sample_hunyuan(
                         transformer=transformer,
                     sampler="unipc",
                     width=width,
@@ -1410,16 +1452,28 @@ def run_generation(
                     clean_latents_4x=clean_latents_4x,
                     clean_latent_4x_indices=clean_latent_4x_indices,
                     callback=callback,
-                )
+            )
+            _samp_prof.stop()
             print("Sampling profiler (top CPU ops):", flush=True)
-            print(_samp_prof.key_averages().sort_by("cpu_time_total").table(row_limit=10), flush=True)
+            print(_samp_prof.key_averages().table(sort_by="cpu_time_total", row_limit=10), flush=True)
+            _samp_trace_path = os.path.join(INVOCATION_DIR, f"sampling_profile_{int(time.time() * 1000)}.json")
+            _samp_prof.export_chrome_trace(_samp_trace_path)
+            print(f"Sampling profile saved: {_samp_trace_path}", flush=True)
             print()
 
             if is_last_section:
                 generated_latents = torch.cat([start_latent.to(generated_latents), generated_latents], dim=2)
 
-            total_generated_latent_frames += int(generated_latents.shape[2])
-            history_latents = torch.cat([generated_latents.to(history_latents), history_latents], dim=2)
+            _generated_frames = int(generated_latents.shape[2])
+            total_generated_latent_frames += _generated_frames
+            # Prepend generated latents without allocating a new history tensor.
+            if _history_len > 0:
+                _history_buffer[:, :, _generated_frames:_generated_frames + _history_len].copy_(
+                    _history_buffer[:, :, :_history_len]
+                )
+            _history_buffer[:, :, :_generated_frames] = generated_latents.to(_history_buffer)
+            _history_len += _generated_frames
+            history_latents = _history_buffer[:, :, :_history_len]
 
             if dynamic_swap:
                 offload_model_from_device_for_memory_preservation(transformer, target_device=gpu, preserved_memory_gb=8)
@@ -1484,7 +1538,10 @@ def run_generation(
                         current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
                     history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
             print("VAE decode profiler (top CPU ops):", flush=True)
-            print(_vae_prof.key_averages().sort_by("cpu_time_total").table(row_limit=10), flush=True)
+            print(_vae_prof.key_averages().table(sort_by="cpu_time_total", row_limit=10), flush=True)
+            _vae_trace_path = os.path.join(INVOCATION_DIR, f"vae_decode_profile_{int(time.time() * 1000)}.json")
+            _vae_prof.export_chrome_trace(_vae_trace_path)
+            print(f"VAE profile saved: {_vae_trace_path}", flush=True)
 
             if dynamic_swap:
                 unload_complete_models()
@@ -1697,6 +1754,17 @@ def main():
 
 
 if __name__ == "__main__":
+    import signal
+
+    def _force_exit(signum, frame):
+        try:
+            stop_status_bar()
+        except Exception:
+            pass
+        os._exit(1)
+
+    signal.signal(signal.SIGINT, _force_exit)
+    signal.signal(signal.SIGTERM, _force_exit)
     start_status_bar()
     try:
         main()
