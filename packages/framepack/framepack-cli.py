@@ -544,30 +544,74 @@ def _keep_output_capture_on_swapped_model(model):
     swapped_cls.__module__ = original_cls.__module__
 
 
-@contextmanager
-def _memory_efficient_attention_on_older_gpus():
-    """Avoid the O(n^2) SDPA fallback on GPUs without bf16 flash support.
+_BEST_SDPA_BACKEND = None
 
-    FramePack's attention kernels call `F.scaled_dot_product_attention` with
-    bfloat16 tensors. On pre-Ampere GPUs (e.g. T4) PyTorch has no efficient
-    bf16 kernel and falls back to materializing the full attention matrix.
-    Running that call in fp16 through the memory-efficient kernel keeps VRAM
-    usage bounded; newer GPUs keep their native flash/cudnn kernels.
-    """
-    if not (torch.cuda.is_available() and torch.cuda.get_device_capability() < (8, 0)):
-        yield
-        return
+
+def _benchmark_sdpa_backends():
+    """Benchmark PyTorch SDPA backends and return the fastest working one."""
+    global _BEST_SDPA_BACKEND
+    if _BEST_SDPA_BACKEND is not None:
+        return _BEST_SDPA_BACKEND
+    if not torch.cuda.is_available():
+        return None
 
     import torch.nn.functional as F
     from torch.nn.attention import SDPBackend, sdpa_kernel
 
+    # Small, representative attention workload.
+    B, H, S, D = 1, 8, 256, 64
+    q = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+    k = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+    v = torch.randn(B, H, S, D, device="cuda", dtype=torch.float16)
+
+    best_backend = None
+    best_time = None
+    for backend in (SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH):
+        try:
+            with sdpa_kernel(backend):
+                torch.cuda.synchronize()
+                t0 = time.time()
+                for _ in range(5):
+                    _ = F.scaled_dot_product_attention(q, k, v)
+                torch.cuda.synchronize()
+                elapsed = (time.time() - t0) / 5.0
+            if best_time is None or elapsed < best_time:
+                best_time = elapsed
+                best_backend = backend
+            print(f"SDPA benchmark: {backend.name} = {elapsed * 1000:.2f} ms", flush=True)
+        except Exception as e:
+            print(f"SDPA benchmark: {backend.name} failed: {str(e)[:120]}", flush=True)
+
+    _BEST_SDPA_BACKEND = best_backend
+    if best_backend is not None:
+        print(f"Selected SDPA backend: {best_backend.name}", flush=True)
+    else:
+        print("No SDPA backend benchmarked successfully; using default.", flush=True)
+    return best_backend
+
+
+@contextmanager
+def _memory_efficient_attention_on_older_gpus():
+    """Benchmark PyTorch SDPA backends and use the fastest one.
+
+    This replaces the older fixed memory-efficient fallback. On this ROCm iGPU,
+    the benchmark may select memory-efficient attention even when flash is
+    available, because the flash path is not the fastest implementation.
+    """
+    best_backend = _benchmark_sdpa_backends()
+    if best_backend is None or not torch.cuda.is_available():
+        yield
+        return
+
+    import torch.nn.functional as F
+    from torch.nn.attention import sdpa_kernel
+
     original_sdpa = F.scaled_dot_product_attention
 
     def sdpa(query, key, value, *args, **kwargs):
-        if query.is_cuda and query.dtype == torch.bfloat16:
-            with sdpa_kernel(SDPBackend.EFFICIENT_ATTENTION):
-                result = original_sdpa(query.half(), key.half(), value.half(), *args, **kwargs)
-            return result.to(torch.bfloat16)
+        if query.is_cuda and query.dtype in (torch.float16, torch.bfloat16):
+            with sdpa_kernel(best_backend):
+                return original_sdpa(query, key, value, *args, **kwargs)
         return original_sdpa(query, key, value, *args, **kwargs)
 
     F.scaled_dot_product_attention = sdpa
@@ -794,8 +838,9 @@ def _status_bar_loop(interval=5):
                 gpu_str = f"util {gpu_util:.0f}% | VRAM {gpu_str}"
             else:
                 gpu_str = f"VRAM {gpu_str}"
+            stage = _STATUS_STAGE[:24]
             line = (
-                f"\r[STATUS] stage={_STATUS_STAGE} | CPU {cpu:5.1f}% | "
+                f"\r\033[2K[STATUS] {stage} | CPU {cpu:4.1f}% | "
                 f"RAM {mem_used_gb:.1f}/{mem_total_gb:.1f}GB | GPU {gpu_str}   "
             )
             sys.stderr.write(line)
@@ -1333,35 +1378,41 @@ def run_generation(
                 print(f"\rSampling {current_step}/{steps} ({percentage}%)", end="", flush=True)
                 return
 
-            generated_latents = sample_hunyuan(
-                transformer=transformer,
-                sampler="unipc",
-                width=width,
-                height=height,
-                frames=num_frames,
-                real_guidance_scale=cfg,
-                distilled_guidance_scale=gs,
-                guidance_rescale=rs,
-                num_inference_steps=steps,
-                generator=rnd,
-                prompt_embeds=llama_vec,
-                prompt_embeds_mask=llama_attention_mask,
-                prompt_poolers=clip_l_pooler,
-                negative_prompt_embeds=llama_vec_n,
-                negative_prompt_embeds_mask=llama_attention_mask_n,
-                negative_prompt_poolers=clip_l_pooler_n,
-                device=gpu,
-                dtype=INFERENCE_DTYPE or torch.bfloat16,
-                image_embeddings=image_encoder_last_hidden_state,
-                latent_indices=latent_indices,
-                clean_latents=clean_latents,
-                clean_latent_indices=clean_latent_indices,
-                clean_latents_2x=clean_latents_2x,
-                clean_latent_2x_indices=clean_latent_2x_indices,
-                clean_latents_4x=clean_latents_4x,
-                clean_latent_4x_indices=clean_latent_4x_indices,
-                callback=callback,
-            )
+            _samp_activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                _samp_activities.append(torch.profiler.ProfilerActivity.CUDA)
+            with torch.profiler.profile(activities=_samp_activities, record_shapes=True) as _samp_prof:
+                generated_latents = sample_hunyuan(
+                        transformer=transformer,
+                    sampler="unipc",
+                    width=width,
+                    height=height,
+                    frames=num_frames,
+                    real_guidance_scale=cfg,
+                    distilled_guidance_scale=gs,
+                    guidance_rescale=rs,
+                    num_inference_steps=steps,
+                    generator=rnd,
+                    prompt_embeds=llama_vec,
+                    prompt_embeds_mask=llama_attention_mask,
+                    prompt_poolers=clip_l_pooler,
+                    negative_prompt_embeds=llama_vec_n,
+                    negative_prompt_embeds_mask=llama_attention_mask_n,
+                    negative_prompt_poolers=clip_l_pooler_n,
+                    device=gpu,
+                    dtype=INFERENCE_DTYPE or torch.bfloat16,
+                    image_embeddings=image_encoder_last_hidden_state,
+                    latent_indices=latent_indices,
+                    clean_latents=clean_latents,
+                    clean_latent_indices=clean_latent_indices,
+                    clean_latents_2x=clean_latents_2x,
+                    clean_latent_2x_indices=clean_latent_2x_indices,
+                    clean_latents_4x=clean_latents_4x,
+                    clean_latent_4x_indices=clean_latent_4x_indices,
+                    callback=callback,
+                )
+            print("Sampling profiler (top CPU ops):", flush=True)
+            print(_samp_prof.key_averages().sort_by("cpu_time_total").table(row_limit=10), flush=True)
             print()
 
             if is_last_section:
@@ -1388,46 +1439,52 @@ def run_generation(
                     torch.cuda.empty_cache()
             real_history_latents = history_latents[:, :, :total_generated_latent_frames, :, :]
 
-            if history_pixels is None:
-                try:
-                    history_pixels = vae_decode(real_history_latents, vae).cpu()
-                except RuntimeError as e:
-                    if "out of memory" not in str(e).lower():
-                        raise
-                    print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
-                    log_execution("GPU_CRASH: VAE decode OOM; falling back to CPU")
-                    vae_force_cpu = True
+            _vae_prof_activities = [torch.profiler.ProfilerActivity.CPU]
+            if torch.cuda.is_available():
+                _vae_prof_activities.append(torch.profiler.ProfilerActivity.CUDA)
+            with torch.profiler.profile(activities=_vae_prof_activities, record_shapes=True) as _vae_prof:
+                if history_pixels is None:
                     try:
-                        vae = vae.to("cpu")
-                    except Exception:
-                        pass
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    history_pixels = vae_decode(real_history_latents, vae).cpu()
-            else:
-                section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
-                overlapped_frames = latent_window_size * 4 - 3
+                        history_pixels = vae_decode(real_history_latents, vae).cpu()
+                    except RuntimeError as e:
+                        if "out of memory" not in str(e).lower():
+                            raise
+                        print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
+                        log_execution("GPU_CRASH: VAE decode OOM; falling back to CPU")
+                        vae_force_cpu = True
+                        try:
+                            vae = vae.to("cpu")
+                        except Exception:
+                            pass
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        history_pixels = vae_decode(real_history_latents, vae).cpu()
+                else:
+                    section_latent_frames = (latent_window_size * 2 + 1) if is_last_section else (latent_window_size * 2)
+                    overlapped_frames = latent_window_size * 4 - 3
 
-                try:
-                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                except RuntimeError as e:
-                    if "out of memory" not in str(e).lower():
-                        raise
-                    print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
-                    log_execution("GPU_CRASH: VAE decode OOM; falling back to CPU")
-                    vae_force_cpu = True
                     try:
-                        vae = vae.to("cpu")
-                    except Exception:
-                        pass
-                    import gc
-                    gc.collect()
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
-                history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+                        current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                    except RuntimeError as e:
+                        if "out of memory" not in str(e).lower():
+                            raise
+                        print("VAE decode OOM on GPU; falling back to CPU.", flush=True)
+                        log_execution("GPU_CRASH: VAE decode OOM; falling back to CPU")
+                        vae_force_cpu = True
+                        try:
+                            vae = vae.to("cpu")
+                        except Exception:
+                            pass
+                        import gc
+                        gc.collect()
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        current_pixels = vae_decode(real_history_latents[:, :, :section_latent_frames], vae).cpu()
+                    history_pixels = soft_append_bcthw(current_pixels, history_pixels, overlapped_frames)
+            print("VAE decode profiler (top CPU ops):", flush=True)
+            print(_vae_prof.key_averages().sort_by("cpu_time_total").table(row_limit=10), flush=True)
 
             if dynamic_swap:
                 unload_complete_models()
